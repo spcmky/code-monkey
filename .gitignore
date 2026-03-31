@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env*
+!.env.example
+*.js.map
+coverage/
+.tsbuildinfo
+*.tsbuildinfo
+.DS_Store
+.terraform/
+.tofu/
+*.tfstate*
+*.tfvars
+!*.tfvars.example
+tfplan
+*.tfplan
+.terraform.lock.hcl

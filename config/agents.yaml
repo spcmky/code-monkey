@@ -1,0 +1,118 @@
+# =============================================================================
+# code-monkey Agent Configuration
+# Per-agent settings for the autonomous pipeline
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Watcher — monitors GitHub for new activity
+# ---------------------------------------------------------------------------
+watcher:
+  poll_interval: "5m"
+  watch:
+    - issues
+    - pull_requests
+    - comments
+  filters:
+    state: open
+    exclude_labels:
+      - wontfix
+      - duplicate
+    exclude_authors:
+      - dependabot
+      - dependabot[bot]
+      - renovate
+      - renovate[bot]
+
+# ---------------------------------------------------------------------------
+# Triage — classifies and prioritises incoming issues
+# ---------------------------------------------------------------------------
+triage:
+  model: haiku
+  max_tokens: 2048
+  temperature: 0.1
+  categories:
+    - bug
+    - feature
+    - question
+    - documentation
+    - dependency_update
+    - refactor
+    - out_of_scope
+  priorities:
+    - critical
+    - high
+    - medium
+    - low
+
+# ---------------------------------------------------------------------------
+# Coder — implements fixes and features in code
+# ---------------------------------------------------------------------------
+coder:
+  model: sonnet
+  max_tokens: 8192
+  temperature: 0.3
+  max_retries: 3
+  tools:
+    - file_read
+    - file_write
+    - file_search
+    - shell_exec
+    - git_diff
+    - test_runner
+    - linter
+  constraints:
+    must_create_branch: true
+    must_run_tests: true
+    branch_prefix: "code-monkey/"
+    commit_prefix: "[code-monkey]"
+
+# ---------------------------------------------------------------------------
+# Reviewer — evaluates PRs before merge
+# ---------------------------------------------------------------------------
+reviewer:
+  model: sonnet
+  max_tokens: 4096
+  temperature: 0.1
+  max_retries: 3
+  criteria:
+    - correctness
+    - scope
+    - tests
+    - style
+    - security
+    - performance
+  actions:
+    - approve
+    - request_changes
+    - escalate
+  require_reasoning: true
+
+# ---------------------------------------------------------------------------
+# Notifier — sends alerts and summaries
+# ---------------------------------------------------------------------------
+notifier:
+  model: haiku
+  max_tokens: 1024
+  temperature: 0.3
+  channel: sns
+  notify_on:
+    - escalation
+    - merge
+    - failure
+    - rate_limit
+    - daily_summary
+
+# ---------------------------------------------------------------------------
+# Controller — validates agent outputs and maintains audit trail
+# ---------------------------------------------------------------------------
+controller:
+  model: sonnet
+  max_tokens: 2048
+  temperature: 0.1
+  validation:
+    grounding_check: true
+    scope_check: true
+    fact_check: true
+  audit:
+    log_all: true
+    retention_days: 90

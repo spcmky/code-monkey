@@ -1,0 +1,29 @@
+# NOTE: For production, pin by digest e.g. node:22-alpine@sha256:<digest>
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src/ ./src/
+
+RUN npm run build
+
+# NOTE: For production, pin by digest e.g. node:22-alpine@sha256:<digest>
+FROM node:22-alpine
+
+# Pin versions for reproducibility; update periodically
+RUN apk add --no-cache git openssh-client
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+COPY --from=builder /app/dist ./dist
+
+USER node
+
+CMD ["node", "dist/agent-worker.js"]

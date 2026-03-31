@@ -1,0 +1,146 @@
+# =============================================================================
+# code-monkey Rules Engine
+# Deterministic routing — evaluated top-to-bottom, first match wins.
+# Matching rules bypass the AI triage agent to save cost and latency.
+# =============================================================================
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # Dependency updates — auto-merge-friendly, skip triage entirely
+  # ---------------------------------------------------------------------------
+  - name: dependency_update
+    match:
+      any:
+        - field: title
+          contains:
+            - bump
+            - "update dependency"
+            - upgrade
+        - field: author
+          in:
+            - dependabot
+            - dependabot[bot]
+            - renovate
+            - renovate[bot]
+            - snyk
+        - field: labels
+          includes: dependencies
+    action:
+      classify: dependency_update
+      priority: low
+      skip_triage: true
+
+  # ---------------------------------------------------------------------------
+  # Typo / spelling fixes — trivial, skip triage
+  # ---------------------------------------------------------------------------
+  - name: typo_fix
+    match:
+      any:
+        - field: title
+          contains:
+            - typo
+            - spelling
+            - grammar
+    action:
+      classify: documentation
+      priority: low
+      skip_triage: true
+
+  # ---------------------------------------------------------------------------
+  # Questions — route to responder, skip coder
+  # ---------------------------------------------------------------------------
+  - name: question
+    match:
+      any:
+        - field: title
+          contains:
+            - "how to"
+            - "how do"
+            - "is it possible"
+            - "can I"
+            - "?"
+    action:
+      classify: question
+      skip_coder: true
+
+  # ---------------------------------------------------------------------------
+  # Security — escalate immediately, no autonomous action
+  # ---------------------------------------------------------------------------
+  - name: security_escalate
+    match:
+      any:
+        - field: title
+          contains:
+            - security
+            - vulnerability
+            - CVE
+            - exploit
+        - field: body
+          contains:
+            - security
+            - vulnerability
+            - CVE
+            - exploit
+    action:
+      escalate: true
+      notify: immediate
+
+  # ---------------------------------------------------------------------------
+  # Large feature requests — too big for autonomous scoping
+  # ---------------------------------------------------------------------------
+  - name: large_feature
+    match:
+      all:
+        - field: labels
+          includes_any:
+            - feature
+            - enhancement
+        - field: body
+          min_length: 2000
+    action:
+      escalate: true
+      reason: "Feature request exceeds 2000 chars — needs human scoping"
+
+  # ---------------------------------------------------------------------------
+  # Duplicate detection — close with a helpful comment
+  # ---------------------------------------------------------------------------
+  - name: duplicate_check
+    scope: same_repo
+    match:
+      all:
+        - field: title
+          similarity:
+            against: open_issues
+            threshold: 0.9
+    action:
+      comment: "This issue appears to be a duplicate. Please check the linked issue above."
+      add_label: duplicate
+      close: true
+
+  # ---------------------------------------------------------------------------
+  # Stale issue warning — nudge before auto-close
+  # ---------------------------------------------------------------------------
+  - name: stale_warning
+    match:
+      all:
+        - field: last_activity_days
+          greater_than: 21
+        - field: state
+          equals: open
+        - field: labels
+          excludes:
+            - pinned
+            - in-progress
+    action:
+      comment: "This issue has been inactive for 21+ days. It will be closed in 9 days if there is no further activity."
+      add_label: stale
+
+  # ---------------------------------------------------------------------------
+  # Fallback — nothing matched, hand off to AI triage
+  # ---------------------------------------------------------------------------
+  - name: fallback
+    match:
+      always: true
+    action:
+      use_ai_triage: true

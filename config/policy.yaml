@@ -1,0 +1,91 @@
+# =============================================================================
+# code-monkey Policy Configuration
+# Guardrails, thresholds, and safety controls for autonomous operations
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Scope control — which issue labels the agent may act on vs escalate
+# ---------------------------------------------------------------------------
+scope:
+  allowed_labels:
+    - bug
+    - enhancement
+    - feature
+    - question
+    - documentation
+    - dependencies
+  escalate_labels:
+    - security
+    - breaking-change
+    - infrastructure
+    - urgent
+    - needs-discussion
+
+# ---------------------------------------------------------------------------
+# Path controls — what the agent can and cannot touch
+# ---------------------------------------------------------------------------
+paths:
+  # Paths use glob matching via minimatch (https://github.com/isaacs/minimatch)
+  protected:
+    - ".github/workflows/**"
+    - ".env*"
+    - "**/secrets/**"
+    - "**/credentials/**"
+    - "Dockerfile*"
+    - "tofu/**"
+    - "terraform/**"
+    - "**/*.lock"
+    - "package-lock.json"
+    - "yarn.lock"
+    - "pnpm-lock.yaml"
+  allowed:
+    - "src/**"
+    - "lib/**"
+    - "test/**"
+    - "tests/**"
+    - "docs/**"
+    - "README.md"
+
+# ---------------------------------------------------------------------------
+# Thresholds — hard limits before escalation or rejection
+# ---------------------------------------------------------------------------
+thresholds:
+  max_diff_lines: 500
+  max_files_changed: 20
+  max_retries: 3
+  confidence_threshold: 0.7
+  grounding_threshold: 0.7
+  relevance_threshold: 0.7
+  max_tokens_per_issue: 100000
+
+# ---------------------------------------------------------------------------
+# Escalation conditions — any match triggers human review
+# ---------------------------------------------------------------------------
+escalation:
+  conditions:
+    - label_match          # issue carries an escalate_labels label
+    - diff_size_exceeded   # diff exceeds max_diff_lines or max_files_changed
+    - protected_path       # changeset touches a protected path
+    - confidence_below     # model confidence below confidence_threshold
+    - test_failure_retries # tests still fail after max_retries attempts
+    - reviewer_rejected_x2 # reviewer requested changes twice on same PR
+    - high_complexity      # cyclomatic or cognitive complexity above normal
+
+# ---------------------------------------------------------------------------
+# Auto-close rules — keep the backlog clean
+# ---------------------------------------------------------------------------
+auto_close:
+  stale_days: 30
+  labels:
+    - wontfix
+    - duplicate
+    - invalid
+
+# ---------------------------------------------------------------------------
+# Rate limits — prevent runaway automation
+# ---------------------------------------------------------------------------
+rate_limits:
+  max_issues_per_hour: 10
+  max_prs_per_hour: 5
+  max_comments_per_hour: 20
+  cooldown_after_failure_minutes: 15
