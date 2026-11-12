@@ -94,7 +94,7 @@ export class BedrockClient {
     }));
 
     for (let iteration = 0; iteration < maxIterations; iteration++) {
-      const response = await withRetry(
+      const response = await withRetry<Message>(
         () =>
           this.anthropicClient.messages.create({
             model: modelId,

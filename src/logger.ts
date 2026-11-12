@@ -26,6 +26,16 @@ function redactSensitive(obj: unknown, depth = 0): unknown {
   if (typeof obj === "string") return obj;
   if (typeof obj === "number" || typeof obj === "boolean") return obj;
 
+  // Errors have non-enumerable fields, so expand them explicitly
+  if (obj instanceof Error) {
+    return {
+      name: obj.name,
+      message: obj.message,
+      stack: obj.stack,
+      ...(redactSensitive({ ...obj }, depth + 1) as Record<string, unknown>),
+    };
+  }
+
   if (Array.isArray(obj)) {
     return obj.map((item) => redactSensitive(item, depth + 1));
   }
@@ -46,9 +56,14 @@ function redactSensitive(obj: unknown, depth = 0): unknown {
 }
 
 const redactFormat = winston.format((info) => {
-  // Redact sensitive fields in metadata
-  const redacted = redactSensitive(info) as winston.Logform.TransformableInfo;
-  return redacted;
+  // Redact in place: winston keeps level/message under symbol keys on this
+  // object, and transports drop any entry that loses them.
+  for (const key of Object.keys(info)) {
+    info[key] = SENSITIVE_KEYS.has(key.toLowerCase())
+      ? "[REDACTED]"
+      : redactSensitive(info[key], 1);
+  }
+  return info;
 });
 
 const logger = winston.createLogger({

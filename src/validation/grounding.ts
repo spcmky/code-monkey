@@ -1,5 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
 import type { AgentResult, ValidationResult, ValidationError } from "../types/index.js";
 import { validatePath } from "../utils/path-safety.js";
 import logger from "../logger.js";

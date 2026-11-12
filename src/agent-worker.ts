@@ -11,7 +11,7 @@ import { CoderAgent } from "./agents/coder.js";
 import { ReviewerAgent } from "./agents/reviewer.js";
 import { BaseAgent } from "./agents/base-agent.js";
 import { TaskMessageSchema } from "./types/index.js";
-import type { AgentType, TaskMessage, AgentResult } from "./types/index.js";
+import type { TaskMessage } from "./types/index.js";
 import logger from "./logger.js";
 
 async function main(): Promise<void> {

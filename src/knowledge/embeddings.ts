@@ -2,10 +2,7 @@ import pg from "pg";
 import pgvector from "pgvector";
 import { createHash } from "node:crypto";
 import { BedrockClient } from "../tools/bedrock.js";
-import type { Issue, EmbeddingRecord } from "../types/index.js";
 import logger from "../logger.js";
-
-const { Pool } = pg;
 
 export class EmbeddingStore {
   private pool: pg.Pool;

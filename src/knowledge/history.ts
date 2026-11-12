@@ -1,5 +1,4 @@
 import pg from "pg";
-import { createHash } from "node:crypto";
 import { EmbeddingStore } from "./embeddings.js";
 import type { Issue } from "../types/index.js";
 import logger from "../logger.js";
