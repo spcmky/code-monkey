@@ -160,7 +160,8 @@ export class Store {
 
   /**
    * Moves an issue from one state to another and records the transition, in
-   * one transaction. Returns false (and changes nothing) when the issue is no
+   * one transaction. Also clears current_task_id: whatever task the issue was
+   * waiting on belongs to the state it just left. Returns false (and changes nothing) when the issue is no
    * longer in `from`, which means another worker or a duplicate message got
    * there first.
    */
@@ -175,6 +176,7 @@ export class Store {
       const updated = await client.query(
         `UPDATE issues
          SET state = $1::varchar,
+             current_task_id = NULL,
              escalation_reason = CASE WHEN $1::varchar = 'ESCALATED' THEN $4::text ELSE escalation_reason END
          WHERE id = $2 AND state = $3 AND deleted_at IS NULL`,
         [transition.to, id, transition.from, reason ?? null]
@@ -207,6 +209,14 @@ export class Store {
     } finally {
       client.release();
     }
+  }
+
+  /** Records the agent task the issue is now waiting on. */
+  async setCurrentTask(id: string, taskId: string): Promise<void> {
+    await this.pool.query(
+      "UPDATE issues SET current_task_id = $1 WHERE id = $2",
+      [taskId, id]
+    );
   }
 
   /**
@@ -391,6 +401,7 @@ export class Store {
       confidence: row.confidence as number | undefined,
       priority: row.priority as Issue["priority"],
       assignedAgent: row.assigned_agent as Issue["assignedAgent"],
+      currentTaskId: (row.current_task_id as string | null) ?? undefined,
       createdAt: new Date(row.github_created_at as string ?? row.created_at as string),
       updatedAt: new Date(row.github_updated_at as string ?? row.updated_at as string),
       url: `https://github.com/${repoOwner}/${repoName}/issues/${issueNumber}`,

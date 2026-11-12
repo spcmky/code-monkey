@@ -41,6 +41,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     author: "reporter",
     labels: ["bug"],
     state: "DETECTED",
+    currentTaskId: "task-1",
     createdAt: new Date(),
     updatedAt: new Date(),
     url: "https://github.com/owner/repo/issues/7",
@@ -51,7 +52,13 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
 /** In-memory stand-in for the parts of Store the controller uses. */
 class FakeStore {
   issues = new Map<string, Issue>();
-  transitions: Array<{ issueId: string; from: string; to: string }> = [];
+  transitions: Array<{
+    issueId: string;
+    from: string;
+    to: string;
+    reason?: string;
+  }> = [];
+  failTriageUpdateOnce = false;
   triage = new Map<string, { classification: string; priority: string }>();
 
   add(issue: Issue): Issue {
@@ -70,12 +77,22 @@ class FakeStore {
       .map((i) => ({ ...i }));
   }
 
-  async transitionIssue(id: string, t: StateTransition): Promise<boolean> {
+  async transitionIssue(
+    id: string,
+    t: StateTransition,
+    reason?: string
+  ): Promise<boolean> {
     const issue = this.issues.get(id);
     if (!issue || issue.state !== t.from) return false;
     issue.state = t.to;
-    this.transitions.push({ issueId: id, from: t.from, to: t.to });
+    issue.currentTaskId = undefined;
+    this.transitions.push({ issueId: id, from: t.from, to: t.to, reason });
     return true;
+  }
+
+  async setCurrentTask(id: string, taskId: string): Promise<void> {
+    const issue = this.issues.get(id);
+    if (issue) issue.currentTaskId = taskId;
   }
 
   async countReviewCycles(id: string): Promise<number> {
@@ -89,6 +106,10 @@ class FakeStore {
     id: string,
     triage: { classification: string; priority: string }
   ): Promise<void> {
+    if (this.failTriageUpdateOnce) {
+      this.failTriageUpdateOnce = false;
+      throw new Error("database unavailable");
+    }
     this.triage.set(id, triage);
   }
 
@@ -115,6 +136,7 @@ function triageResult(
 
 function coderResult(files: Record<string, string>, success = true): AgentResult {
   return {
+    taskId: "task-1",
     success,
     agentType: "coder",
     issueId: "issue-1",
@@ -131,8 +153,9 @@ function coderResult(files: Record<string, string>, success = true): AgentResult
   };
 }
 
-function reviewerResult(decision: string): AgentResult {
+function reviewerResult(decision: string, taskId = "task-1"): AgentResult {
   return {
+    taskId,
     success: true,
     agentType: "reviewer",
     issueId: "issue-1",
@@ -277,13 +300,66 @@ describe("Controller", () => {
       expect(store.path("issue-1")).toEqual(["ESCALATED"]);
     });
 
-    it("escalates when the coder task cannot be dispatched", async () => {
+    it("retries the coder dispatch on the next poll when it fails", async () => {
       sendShouldFail = true;
       store.add(makeIssue());
       await controller.poll();
 
-      expect(store.issues.get("issue-1")?.state).toBe("ESCALATED");
+      expect(store.issues.get("issue-1")?.state).toBe("IN_PROGRESS");
+      expect(store.issues.get("issue-1")?.currentTaskId).toBeUndefined();
+      expect(sent).toEqual([]);
+
+      sendShouldFail = false;
+      await controller.poll();
+
+      expect(sent).toEqual([{ agentType: "coder", issueId: "issue-1" }]);
+      expect(store.issues.get("issue-1")?.currentTaskId).toBeDefined();
     });
+  });
+
+  describe("interrupted hand-offs", () => {
+    it("escalates an issue stranded in TRIAGED", async () => {
+      store.failTriageUpdateOnce = true;
+      store.add(makeIssue());
+      await controller.poll();
+
+      expect(store.path("issue-1")).toEqual(["TRIAGED", "ESCALATED"]);
+      expect(sent).toEqual([]);
+      expect(notifyEscalation).toHaveBeenCalledTimes(1);
+    });
+
+    it("hands an issue left in ASSIGNED to the coder", async () => {
+      store.add(makeIssue({ state: "ASSIGNED", currentTaskId: undefined }));
+      await controller.poll();
+
+      expect(store.issues.get("issue-1")?.state).toBe("IN_PROGRESS");
+      expect(sent).toEqual([{ agentType: "coder", issueId: "issue-1" }]);
+    });
+
+    it("dispatches the coder for IN_PROGRESS with no outstanding task", async () => {
+      store.add(makeIssue({ state: "IN_PROGRESS", currentTaskId: undefined }));
+      await controller.poll();
+
+      expect(sent).toEqual([{ agentType: "coder", issueId: "issue-1" }]);
+    });
+
+    it("dispatches the reviewer for UNDER_REVIEW with no outstanding task", async () => {
+      store.add(makeIssue({ state: "UNDER_REVIEW", currentTaskId: undefined }));
+      await controller.poll();
+
+      expect(sent).toEqual([{ agentType: "reviewer", issueId: "issue-1" }]);
+    });
+
+    it.each(["IN_PROGRESS", "UNDER_REVIEW"] as const)(
+      "does not dispatch again while a task is outstanding in %s",
+      async (state) => {
+        store.add(makeIssue({ state }));
+        await controller.poll();
+        await controller.poll();
+
+        expect(sent).toEqual([]);
+      }
+    );
   });
 
   describe("coder results", () => {
@@ -341,6 +417,17 @@ describe("Controller", () => {
       expect(sent).toEqual([{ agentType: "coder", issueId: "issue-1" }]);
     });
 
+    it("records the trigger, not the loop-limit reason, for an ordinary change request", async () => {
+      store.add(makeIssue({ state: "UNDER_REVIEW" }));
+      enqueue(reviewerResult("request_changes"));
+      await controller.poll();
+
+      expect(store.transitions.at(-1)).toMatchObject({
+        to: "IN_PROGRESS",
+        reason: undefined,
+      });
+    });
+
     it("escalates once the review cycle limit is reached", async () => {
       const issue = store.add(makeIssue({ state: "UNDER_REVIEW" }));
       for (let cycle = 0; cycle < MAX_REVIEW_CYCLES; cycle++) {
@@ -356,6 +443,7 @@ describe("Controller", () => {
       expect(store.issues.get("issue-1")?.state).toBe("ESCALATED");
       expect(sent).toEqual([]);
       expect(notifyEscalation).toHaveBeenCalledTimes(1);
+      expect(store.transitions.at(-1)?.reason).toBe("Review loop limit reached");
     });
 
     it("escalates on an unknown decision", async () => {
@@ -376,6 +464,39 @@ describe("Controller", () => {
       expect(store.issues.get("issue-1")?.state).toBe("VALIDATED");
       expect(sent).toEqual([]);
       expect(deleted).toEqual(["r1"]);
+    });
+
+    it("drops a reviewer result from an earlier dispatch", async () => {
+      store.add(makeIssue({ state: "UNDER_REVIEW", currentTaskId: "task-2" }));
+      enqueue(reviewerResult("approve", "task-1"));
+      await controller.poll();
+
+      expect(store.issues.get("issue-1")?.state).toBe("UNDER_REVIEW");
+      expect(deleted).toEqual(["r1"]);
+    });
+
+    it("accepts the result of the current dispatch after a re-review", async () => {
+      store.add(makeIssue({ state: "UNDER_REVIEW" }));
+      enqueue(reviewerResult("request_changes"));
+      await controller.poll();
+      const coderTask = store.issues.get("issue-1")?.currentTaskId;
+      expect(coderTask).toBeDefined();
+      expect(coderTask).not.toBe("task-1");
+
+      // The first review's result is redelivered after the issue moved on
+      enqueue({ ...coderResult({ "src/fix.ts": "export {};\n" }), taskId: coderTask });
+      await controller.poll();
+      expect(store.issues.get("issue-1")?.state).toBe("UNDER_REVIEW");
+
+      enqueue(reviewerResult("approve", "task-1"));
+      await controller.poll();
+      expect(store.issues.get("issue-1")?.state).toBe("UNDER_REVIEW");
+
+      enqueue(
+        reviewerResult("approve", store.issues.get("issue-1")?.currentTaskId)
+      );
+      await controller.poll();
+      expect(store.issues.get("issue-1")?.state).toBe("VALIDATED");
     });
 
     it("processes a duplicated result only once", async () => {

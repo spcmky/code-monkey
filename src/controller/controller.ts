@@ -41,14 +41,26 @@ export interface ControllerDeps {
 }
 
 // The state an issue must be in for a result from each agent to be current.
-// Anything else is a duplicate or late delivery and is dropped.
+// The result must also carry the issue's current task id. Anything else is a
+// duplicate or late delivery and is dropped.
 const EXPECTED_STATE: Partial<Record<AgentType, IssueState>> = {
   coder: "IN_PROGRESS",
   reviewer: "UNDER_REVIEW",
 };
 
-// States the poll loop picks up, so work resumes after a restart
-const RESUMABLE_STATES: IssueState[] = ["DETECTED", "IMPLEMENTED"];
+// States where the controller may owe the next step. The poll loop re-reads
+// all of them every cycle, so a hand-off interrupted by an error or a restart
+// is picked up again. VALIDATED is absent until the merge step exists.
+const RESUMABLE_STATES: IssueState[] = [
+  "DETECTED",
+  "TRIAGED",
+  "ASSIGNED",
+  "IMPLEMENTED",
+  "IN_PROGRESS",
+  "UNDER_REVIEW",
+];
+
+const REVIEW_LOOP_REASON = "Review loop limit reached";
 
 export class Controller {
   private watcher: ControllerDeps["watcher"];
@@ -130,7 +142,7 @@ export class Controller {
 
       // Step 2: Advance every issue that is waiting on the controller. Reading
       // from the store (not just this cycle's new issues) picks up issues that
-      // came into scope after a label change and resumes after a restart.
+      // came into scope after a label change and resumes interrupted hand-offs.
       for (const state of RESUMABLE_STATES) {
         const issues = await this.store.getIssuesByState(state);
         for (const issue of issues) {
@@ -160,8 +172,24 @@ export class Controller {
       case "DETECTED":
         await this.triage(issue);
         break;
+      case "TRIAGED":
+        // Triage normally leaves TRIAGED within the same call. Finding an
+        // issue here means that hand-off was interrupted, and the triage
+        // decision was not persisted, so a human decides.
+        await this.escalate(issue, "Hand-off interrupted after triage");
+        break;
+      case "ASSIGNED":
+        await this.startCoder(issue, "work_started");
+        break;
       case "IMPLEMENTED":
         await this.startReview(issue);
+        break;
+      case "IN_PROGRESS":
+        // No outstanding task means the dispatch never happened
+        if (!issue.currentTaskId) await this.dispatch(issue, "coder");
+        break;
+      case "UNDER_REVIEW":
+        if (!issue.currentTaskId) await this.dispatch(issue, "reviewer");
         break;
       default:
         logger.debug(`No action for issue ${issue.id} in state ${issue.state}`);
@@ -230,34 +258,35 @@ export class Controller {
     }
   }
 
-  /** Moves the issue to IN_PROGRESS and hands it to the coder. */
+  /**
+   * Moves the issue to IN_PROGRESS and hands it to the coder. The state change
+   * comes first and clears the issue's task id; if the dispatch then fails or
+   * never runs, the poll loop sees IN_PROGRESS with no task and dispatches.
+   */
   private async startCoder(issue: Issue, trigger: string): Promise<void> {
     if (issue.state !== "IN_PROGRESS") {
       const next = await this.transition(issue, "IN_PROGRESS", trigger);
       if (next !== "IN_PROGRESS") return;
     }
-    try {
-      await this.dispatch(issue, "coder");
-    } catch (error) {
-      logger.error(`Failed to dispatch coder for issue ${issue.id}`, { error });
-      await this.escalate(issue, "Failed to dispatch coder task");
-    }
+    await this.dispatch(issue, "coder");
   }
 
-  /**
-   * Hands the issue to the reviewer. Dispatch comes first: if the state update
-   * is lost the next poll dispatches again, and the duplicate result is
-   * dropped by the stale-result check.
-   */
+  /** Moves the issue to UNDER_REVIEW and hands it to the reviewer. */
   private async startReview(issue: Issue): Promise<void> {
-    await this.dispatch(issue, "reviewer");
-    await this.transition(issue, "UNDER_REVIEW", "review_started", "reviewer");
+    const next = await this.transition(
+      issue,
+      "UNDER_REVIEW",
+      "review_started",
+      "reviewer"
+    );
+    if (next === "UNDER_REVIEW") await this.dispatch(issue, "reviewer");
   }
 
   /**
    * The only place issue state changes. Persists the transition and returns
    * the state actually applied (which is ESCALATED when the review loop limit
-   * forces it), or null if the issue had already moved on.
+   * forces it), or null if the issue had already moved on. A transition also
+   * clears the issue's task id, so results for the state it left are stale.
    */
   private async transition(
     issue: Issue,
@@ -279,14 +308,18 @@ export class Controller {
       reviewCycles
     );
 
+    // A forced escalation replaces the requested target, so it gets its own
+    // reason rather than the caller's.
+    const forced = transition.to !== to;
     const applied = await this.store.transitionIssue(
       issue.id,
       transition,
-      reason
+      forced ? REVIEW_LOOP_REASON : reason
     );
     if (!applied) return null;
 
     issue.state = transition.to;
+    issue.currentTaskId = undefined;
     return transition.to;
   }
 
@@ -313,6 +346,11 @@ export class Controller {
         MessageGroupId: issue.id,
       })
     );
+
+    // Recorded after the send: if this write is lost the issue has no task id,
+    // the poll loop dispatches again, and the first task's result is dropped.
+    await this.store.setCurrentTask(issue.id, taskMessage.taskId);
+    issue.currentTaskId = taskMessage.taskId;
 
     logger.info(`Task ${taskMessage.taskId} dispatched to SQS`);
   }
@@ -359,10 +397,17 @@ export class Controller {
   /** Validates an agent result and advances the issue accordingly. */
   async handleResult(issue: Issue, result: AgentResult): Promise<void> {
     const expected = EXPECTED_STATE[result.agentType];
-    if (!expected || issue.state !== expected) {
+    if (
+      !expected ||
+      issue.state !== expected ||
+      !result.taskId ||
+      result.taskId !== issue.currentTaskId
+    ) {
       logger.warn(`Dropping stale ${result.agentType} result for issue ${issue.id}`, {
         state: issue.state,
         expected,
+        taskId: result.taskId,
+        currentTaskId: issue.currentTaskId,
       });
       return;
     }
@@ -405,16 +450,14 @@ export class Controller {
       // TODO: trigger merge
       await this.transition(issue, "VALIDATED", "review_approved", "reviewer");
     } else if (decision === "request_changes") {
-      const reason = "Review loop limit reached";
       const next = await this.transition(
         issue,
         "IN_PROGRESS",
         "review_changes_requested",
-        "reviewer",
-        reason
+        "reviewer"
       );
       if (next === "ESCALATED") {
-        await this.announceEscalation(issue, reason, result);
+        await this.announceEscalation(issue, REVIEW_LOOP_REASON, result);
       } else if (next === "IN_PROGRESS") {
         await this.startCoder(issue, "review_changes_requested");
       }
