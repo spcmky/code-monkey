@@ -6,6 +6,7 @@ import {
 } from "@aws-sdk/client-sqs";
 import { loadAppConfig } from "./config/loader.js";
 import { BedrockClient } from "./tools/bedrock.js";
+import { GitHubClient } from "./tools/github.js";
 import { TriageAgent } from "./agents/triage.js";
 import { CoderAgent } from "./agents/coder.js";
 import { ReviewerAgent } from "./agents/reviewer.js";
@@ -30,11 +31,17 @@ async function main(): Promise<void> {
     guardrailVersion: config.aws.bedrockGuardrailVersion,
   });
 
+  // Agents act on repositories only through this client's API calls
+  const github = new GitHubClient({
+    secretArn: config.aws.githubPatSecretArn,
+    region: config.aws.region,
+  });
+
   // Agent registry
   const agents: Record<string, BaseAgent> = {
     triage: new TriageAgent(bedrock),
-    coder: new CoderAgent(bedrock),
-    reviewer: new ReviewerAgent(bedrock),
+    coder: new CoderAgent(bedrock, github),
+    reviewer: new ReviewerAgent(bedrock, github),
   };
 
   logger.info("Agent worker ready, polling for tasks");

@@ -15,7 +15,9 @@ import type {
   AgentResult,
   Issue,
   IssueState,
+  PullRequestRef,
   StateTransition,
+  ValidationResult,
 } from "../types/index.js";
 
 const policy = new PolicyEngine(
@@ -60,6 +62,11 @@ class FakeStore {
   }> = [];
   failTriageUpdateOnce = false;
   triage = new Map<string, { classification: string; priority: string }>();
+
+  async setIssuePullRequest(id: string, pr: PullRequestRef): Promise<void> {
+    const issue = this.issues.get(id);
+    if (issue) issue.pullRequest = pr;
+  }
 
   add(issue: Issue): Issue {
     this.issues.set(issue.id, issue);
@@ -134,13 +141,21 @@ function triageResult(
   };
 }
 
+const PR: PullRequestRef = {
+  number: 42,
+  url: "https://github.com/owner/repo/pull/42",
+  branch: "code-monkey/issue-7",
+};
+
 function coderResult(files: Record<string, string>, success = true): AgentResult {
   return {
     taskId: "task-1",
     success,
     agentType: "coder",
     issueId: "issue-1",
-    output: {},
+    output: success
+      ? { prNumber: PR.number, prUrl: PR.url, branch: PR.branch }
+      : {},
     reasoning: "implemented",
     toolCalls: Object.entries(files).map(([path, content]) => ({
       name: "writeFile",
@@ -175,6 +190,10 @@ describe("Controller", () => {
   let triageRun: ReturnType<typeof vi.fn>;
   let notifyEscalation: ReturnType<typeof vi.fn>;
   let createComment: ReturnType<typeof vi.fn>;
+  let listPRFiles: ReturnType<typeof vi.fn>;
+  let mergePR: ReturnType<typeof vi.fn>;
+  let isMerged: ReturnType<typeof vi.fn>;
+  let factCheck: ReturnType<typeof vi.fn>;
   let sendShouldFail: boolean;
   let controller: Controller;
 
@@ -187,6 +206,20 @@ describe("Controller", () => {
     triageRun = vi.fn(async () => triageResult("implement"));
     notifyEscalation = vi.fn(async () => {});
     createComment = vi.fn(async () => {});
+    listPRFiles = vi.fn(async () => [
+      { filename: "src/fix.ts", status: "modified", additions: 3, deletions: 1 },
+    ]);
+    mergePR = vi.fn(async () => {});
+    isMerged = vi.fn(async () => false);
+    factCheck = vi.fn(
+      async (): Promise<ValidationResult> => ({
+        valid: true,
+        score: 1,
+        errors: [],
+        warnings: [],
+      })
+    );
+    policy.getPolicy().merge.auto_merge = false;
 
     const send = vi.fn(async (command: unknown) => {
       if (command instanceof SendMessageCommand) {
@@ -212,7 +245,8 @@ describe("Controller", () => {
       watcher: { poll: vi.fn(async () => []) },
       triageAgent: { run: triageRun },
       notifier: { notifyEscalation },
-      github: { createComment },
+      github: { createComment, listPRFiles, mergePR, isMerged },
+      factChecker: { validate: factCheck },
       policy,
       contextBuilder: {
         build: vi.fn(
@@ -373,13 +407,70 @@ describe("Controller", () => {
       expect(deleted).toEqual(["r1"]);
     });
 
-    it("escalates when the coder touches a protected path", async () => {
+    it("records the pull request the coder opened", async () => {
       store.add(makeIssue({ state: "IN_PROGRESS" }));
-      enqueue(coderResult({ ".github/workflows/ci.yml": "on: push\n" }));
+      enqueue(coderResult({ "src/fix.ts": "export {};\n" }));
+      await controller.poll();
+
+      expect(store.issues.get("issue-1")?.pullRequest).toEqual(PR);
+      expect(listPRFiles).toHaveBeenCalledWith("owner", "repo", 42);
+    });
+
+    it("escalates when the pull request touches a protected path", async () => {
+      listPRFiles.mockResolvedValue([
+        { filename: ".github/workflows/ci.yml", status: "added", additions: 5, deletions: 0 },
+      ]);
+      store.add(makeIssue({ state: "IN_PROGRESS" }));
+      // What the agent says it wrote is irrelevant; the real diff decides
+      enqueue(coderResult({ "src/fix.ts": "export {};\n" }));
       await controller.poll();
 
       expect(store.issues.get("issue-1")?.state).toBe("ESCALATED");
+      expect(store.issues.get("issue-1")?.pullRequest).toEqual(PR);
       expect(sent).toEqual([]);
+    });
+
+    it("escalates when the pull request exceeds the diff limit", async () => {
+      listPRFiles.mockResolvedValue([
+        { filename: "src/big.ts", status: "added", additions: 5000, deletions: 0 },
+      ]);
+      store.add(makeIssue({ state: "IN_PROGRESS" }));
+      enqueue(coderResult({}));
+      await controller.poll();
+
+      expect(store.issues.get("issue-1")?.state).toBe("ESCALATED");
+    });
+
+    it("rejects a pull request on a branch the system did not assign", async () => {
+      store.add(makeIssue({ state: "IN_PROGRESS" }));
+      enqueue({
+        ...coderResult({}),
+        output: { prNumber: 1, prUrl: "", branch: "main" },
+      });
+      await controller.poll();
+
+      expect(store.issues.get("issue-1")?.state).toBe("ESCALATED");
+      expect(store.issues.get("issue-1")?.pullRequest).toBeUndefined();
+      expect(listPRFiles).not.toHaveBeenCalled();
+    });
+
+    it("escalates when the fact check rejects the result", async () => {
+      factCheck.mockResolvedValue({
+        valid: false,
+        score: 0,
+        errors: [
+          { code: "GUARDRAIL_NOT_CONFIGURED", message: "x", severity: "error" },
+        ],
+        warnings: [],
+      });
+      store.add(makeIssue({ state: "IN_PROGRESS" }));
+      enqueue(coderResult({}));
+      await controller.poll();
+
+      expect(store.issues.get("issue-1")?.state).toBe("ESCALATED");
+      expect(store.transitions.at(-1)?.reason).toContain(
+        "GUARDRAIL_NOT_CONFIGURED"
+      );
     });
 
     it("escalates when the coder reports failure", async () => {
@@ -400,12 +491,67 @@ describe("Controller", () => {
   });
 
   describe("reviewer results", () => {
-    it("validates an approved review", async () => {
-      store.add(makeIssue({ state: "UNDER_REVIEW" }));
+    it("validates an approved review and leaves the merge to a human", async () => {
+      store.add(makeIssue({ state: "UNDER_REVIEW", pullRequest: PR }));
       enqueue(reviewerResult("approve"));
+      await controller.poll();
       await controller.poll();
 
       expect(store.issues.get("issue-1")?.state).toBe("VALIDATED");
+      expect(mergePR).not.toHaveBeenCalled();
+      expect(createComment).toHaveBeenCalledTimes(1);
+      expect(createComment.mock.calls[0]?.[2]).toBe(42);
+    });
+
+    it("merges an approved pull request when policy allows it", async () => {
+      policy.getPolicy().merge.auto_merge = true;
+      store.add(makeIssue({ state: "UNDER_REVIEW", pullRequest: PR }));
+      enqueue(reviewerResult("approve"));
+      await controller.poll();
+
+      expect(mergePR).toHaveBeenCalledWith("owner", "repo", 42, "squash");
+      expect(store.issues.get("issue-1")?.state).toBe("MERGED");
+    });
+
+    it("does not merge twice when the pull request is already merged", async () => {
+      policy.getPolicy().merge.auto_merge = true;
+      isMerged.mockResolvedValue(true);
+      store.add(makeIssue({ state: "VALIDATED", pullRequest: PR }));
+      await controller.poll();
+
+      expect(mergePR).not.toHaveBeenCalled();
+      expect(store.issues.get("issue-1")?.state).toBe("MERGED");
+    });
+
+    it("escalates when the automatic merge fails", async () => {
+      policy.getPolicy().merge.auto_merge = true;
+      mergePR.mockRejectedValue(new Error("checks failing"));
+      store.add(makeIssue({ state: "UNDER_REVIEW", pullRequest: PR }));
+      enqueue(reviewerResult("approve"));
+      await controller.poll();
+
+      expect(store.issues.get("issue-1")?.state).toBe("ESCALATED");
+    });
+
+    it("posts the review on the pull request when changes are requested", async () => {
+      store.add(makeIssue({ state: "UNDER_REVIEW", pullRequest: PR }));
+      enqueue({
+        ...reviewerResult("request_changes"),
+        output: {
+          decision: "request_changes",
+          reasoning: "Missing null check",
+          comments: [
+            { path: "src/fix.ts", line: 3, body: "guard this", severity: "error" },
+          ],
+        },
+      });
+      await controller.poll();
+
+      const body = createComment.mock.calls[0]?.[3] as string;
+      expect(createComment.mock.calls[0]?.[2]).toBe(42);
+      expect(body).toContain("Missing null check");
+      expect(body).toContain("src/fix.ts:3");
+      expect(store.issues.get("issue-1")?.state).toBe("IN_PROGRESS");
     });
 
     it("sends requested changes back to the coder", async () => {

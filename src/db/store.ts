@@ -6,6 +6,7 @@ import type {
   AgentAction,
   AuditLogEntry,
   IssueState,
+  PullRequestRef,
   StateTransition,
 } from "../types/index.js";
 import { runMigrations } from "./migrations.js";
@@ -211,6 +212,13 @@ export class Store {
     }
   }
 
+  async setIssuePullRequest(id: string, pr: PullRequestRef): Promise<void> {
+    await this.pool.query(
+      "UPDATE issues SET pr_number = $1, pr_url = $2, branch_name = $3 WHERE id = $4",
+      [pr.number, pr.url, pr.branch, id]
+    );
+  }
+
   /** Records the agent task the issue is now waiting on. */
   async setCurrentTask(id: string, taskId: string): Promise<void> {
     await this.pool.query(
@@ -402,6 +410,14 @@ export class Store {
       priority: row.priority as Issue["priority"],
       assignedAgent: row.assigned_agent as Issue["assignedAgent"],
       currentTaskId: (row.current_task_id as string | null) ?? undefined,
+      pullRequest:
+        row.pr_number != null
+          ? {
+              number: row.pr_number as number,
+              url: (row.pr_url as string | null) ?? "",
+              branch: (row.branch_name as string | null) ?? "",
+            }
+          : undefined,
       createdAt: new Date(row.github_created_at as string ?? row.created_at as string),
       updatedAt: new Date(row.github_updated_at as string ?? row.updated_at as string),
       url: `https://github.com/${repoOwner}/${repoName}/issues/${issueNumber}`,

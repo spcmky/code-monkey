@@ -294,10 +294,11 @@ export class GitHubClient {
     await this.rateLimit();
     return withRetry(async () => {
       const kit = await this.getOctokit();
-      const { data } = await kit.pulls.listFiles({
+      const data = await kit.paginate(kit.pulls.listFiles, {
         owner,
         repo,
         pull_number: prNumber,
+        per_page: 100,
       });
       return data.map((f) => ({
         filename: f.filename,
@@ -307,5 +308,189 @@ export class GitHubClient {
         patch: f.patch,
       }));
     }, `listPRFiles(${owner}/${repo}#${prNumber})`);
+  }
+
+  async getDefaultBranch(owner: string, repo: string): Promise<string> {
+    await this.rateLimit();
+    return withRetry(async () => {
+      const kit = await this.getOctokit();
+      const { data } = await kit.repos.get({ owner, repo });
+      return data.default_branch;
+    }, `getDefaultBranch(${owner}/${repo})`);
+  }
+
+  /** Lists file paths in the repository at a ref (branch, tag, or commit). */
+  async listFiles(owner: string, repo: string, ref: string): Promise<string[]> {
+    await this.rateLimit();
+    return withRetry(async () => {
+      const kit = await this.getOctokit();
+      const { data } = await kit.git.getTree({
+        owner,
+        repo,
+        tree_sha: ref,
+        recursive: "true",
+      });
+      return data.tree
+        .filter((entry) => entry.type === "blob" && entry.path)
+        .map((entry) => entry.path as string);
+    }, `listFiles(${owner}/${repo}@${ref})`);
+  }
+
+  /** Searches code on the default branch; returns matching file paths. */
+  async searchCode(owner: string, repo: string, query: string): Promise<string[]> {
+    await this.rateLimit();
+    return withRetry(async () => {
+      const kit = await this.getOctokit();
+      const { data } = await kit.search.code({
+        q: `${query} repo:${owner}/${repo}`,
+        per_page: 30,
+      });
+      return data.items.map((item) => item.path);
+    }, `searchCode(${owner}/${repo})`);
+  }
+
+  /** Returns the head commit SHA of a branch, or null if it does not exist. */
+  async getBranchSha(
+    owner: string,
+    repo: string,
+    branch: string
+  ): Promise<string | null> {
+    await this.rateLimit();
+    const kit = await this.getOctokit();
+    try {
+      const { data } = await kit.git.getRef({
+        owner,
+        repo,
+        ref: `heads/${branch}`,
+      });
+      return data.object.sha;
+    } catch (error) {
+      if ((error as { status?: number }).status === 404) return null;
+      throw error;
+    }
+  }
+
+  /**
+   * Commits whole-file contents to a branch through the Git data API, creating
+   * the branch from `baseBranch` when it does not exist yet. Nothing is cloned
+   * or executed locally.
+   */
+  async commitFiles(
+    owner: string,
+    repo: string,
+    params: {
+      branch: string;
+      baseBranch: string;
+      message: string;
+      files: Array<{ path: string; content: string }>;
+    }
+  ): Promise<{ sha: string }> {
+    await this.rateLimit();
+    const kit = await this.getOctokit();
+
+    const branchSha = await this.getBranchSha(owner, repo, params.branch);
+    const parentSha =
+      branchSha ?? (await this.getBranchSha(owner, repo, params.baseBranch));
+    if (!parentSha) {
+      throw new Error(`Base branch ${params.baseBranch} not found`);
+    }
+
+    const { data: parent } = await kit.git.getCommit({
+      owner,
+      repo,
+      commit_sha: parentSha,
+    });
+    const { data: tree } = await kit.git.createTree({
+      owner,
+      repo,
+      base_tree: parent.tree.sha,
+      tree: params.files.map((file) => ({
+        path: file.path,
+        mode: "100644" as const,
+        type: "blob" as const,
+        content: file.content,
+      })),
+    });
+    const { data: commit } = await kit.git.createCommit({
+      owner,
+      repo,
+      message: params.message,
+      tree: tree.sha,
+      parents: [parentSha],
+    });
+
+    if (branchSha) {
+      await kit.git.updateRef({
+        owner,
+        repo,
+        ref: `heads/${params.branch}`,
+        sha: commit.sha,
+      });
+    } else {
+      await kit.git.createRef({
+        owner,
+        repo,
+        ref: `refs/heads/${params.branch}`,
+        sha: commit.sha,
+      });
+    }
+    logger.info(`Committed ${params.files.length} file(s) to ${owner}/${repo}@${params.branch}`);
+    return { sha: commit.sha };
+  }
+
+  async isMerged(owner: string, repo: string, prNumber: number): Promise<boolean> {
+    await this.rateLimit();
+    const kit = await this.getOctokit();
+    try {
+      await kit.pulls.checkIfMerged({ owner, repo, pull_number: prNumber });
+      return true;
+    } catch (error) {
+      if ((error as { status?: number }).status === 404) return false;
+      throw error;
+    }
+  }
+
+  /** Finds the open PR whose head is the given branch, if any. */
+  async findOpenPR(
+    owner: string,
+    repo: string,
+    branch: string
+  ): Promise<{ number: number; url: string } | null> {
+    await this.rateLimit();
+    return withRetry(async () => {
+      const kit = await this.getOctokit();
+      const { data } = await kit.pulls.list({
+        owner,
+        repo,
+        head: `${owner}:${branch}`,
+        state: "open",
+        per_page: 1,
+      });
+      const pr = data[0];
+      return pr ? { number: pr.number, url: pr.html_url } : null;
+    }, `findOpenPR(${owner}/${repo}@${branch})`);
+  }
+
+  /** Lists comments on an issue or pull request, oldest first. */
+  async listComments(
+    owner: string,
+    repo: string,
+    issueNumber: number
+  ): Promise<Array<{ author: string; body: string; createdAt: string }>> {
+    await this.rateLimit();
+    return withRetry(async () => {
+      const kit = await this.getOctokit();
+      const data = await kit.paginate(kit.issues.listComments, {
+        owner,
+        repo,
+        issue_number: issueNumber,
+        per_page: 100,
+      });
+      return data.map((comment) => ({
+        author: comment.user?.login ?? "unknown",
+        body: comment.body ?? "",
+        createdAt: comment.created_at,
+      }));
+    }, `listComments(${owner}/${repo}#${issueNumber})`);
   }
 }

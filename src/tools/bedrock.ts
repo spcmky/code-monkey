@@ -76,7 +76,7 @@ export class BedrockClient {
     messages: BedrockMessage[],
     tools: BedrockTool[],
     systemPrompt: string,
-    options?: { maxIterations?: number; onToolCall?: (name: string, input: Record<string, unknown>) => Promise<Record<string, unknown>> }
+    options?: { maxIterations?: number; maxTokens?: number; onToolCall?: (name: string, input: Record<string, unknown>) => Promise<Record<string, unknown>> }
   ): Promise<BedrockInvokeResult> {
     const maxIterations = options?.maxIterations ?? 10;
     logger.info(`Invoking Bedrock model ${modelId}`, {
@@ -98,7 +98,7 @@ export class BedrockClient {
         () =>
           this.anthropicClient.messages.create({
             model: modelId,
-            max_tokens: 4096,
+            max_tokens: options?.maxTokens ?? 4096,
             stream: false,
             system: systemPrompt,
             messages: currentMessages,
@@ -232,8 +232,9 @@ export class BedrockClient {
     content: string
   ): Promise<{ action: string; score: number; outputs: string[] }> {
     if (!this.guardrailId) {
-      logger.warn("No guardrail ID configured, skipping guardrail check");
-      return { action: "NONE", score: 1.0, outputs: [content] };
+      // The caller decides whether a missing guardrail is acceptable
+      logger.warn("No guardrail ID configured, guardrail check not run");
+      return { action: "NOT_CONFIGURED", score: 1.0, outputs: [content] };
     }
 
     logger.debug("Applying guardrail", {

@@ -1,6 +1,7 @@
 import { BaseAgent } from "./base-agent.js";
 import type { BedrockTool, BedrockInvokeResult } from "../tools/bedrock.js";
 import type { AgentContext, AgentResult, AgentType } from "../types/index.js";
+import { ReviewerToolSession, type ToolSession } from "../tools/executor.js";
 import { z } from "zod";
 import logger from "../logger.js";
 
@@ -51,28 +52,21 @@ export class ReviewerAgent extends BaseAgent {
 4. Style — does the code follow project conventions?
 5. Security — any security concerns?
 
-Use the submit_review tool to provide your review decision and comments.`;
+Start with get_pr_diff to see what the pull request changes, and use get_file_content to read changed files in full. Base the review on what the code does, not on the pull request's description of itself. Then use the submit_review tool to provide your review decision and comments.`;
 
   readonly tools: BedrockTool[] = [
     {
       name: "get_pr_diff",
-      description: "Get the full diff of the pull request",
-      input_schema: {
-        type: "object",
-        properties: {
-          prNumber: { type: "number" },
-        },
-        required: ["prNumber"],
-      },
+      description: "Get the files and patches changed by the pull request under review",
+      input_schema: { type: "object", properties: {} },
     },
     {
       name: "get_file_content",
-      description: "Get the current content of a file",
+      description: "Get the content of a file on the pull request's branch",
       input_schema: {
         type: "object",
         properties: {
           path: { type: "string" },
-          ref: { type: "string", description: "Git ref (branch/commit)" },
         },
         required: ["path"],
       },
@@ -119,6 +113,14 @@ Use the submit_review tool to provide your review decision and comments.`;
       },
     },
   ];
+
+  protected override createToolSession(
+    context: AgentContext
+  ): ToolSession | undefined {
+    return this.github
+      ? new ReviewerToolSession(this.github, context)
+      : undefined;
+  }
 
   protected parseResponse(
     response: BedrockInvokeResult,

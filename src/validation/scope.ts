@@ -108,3 +108,109 @@ export class ScopeValidator {
     };
   }
 }
+
+/**
+ * Normalizes a repository-relative path supplied by a model and rejects
+ * anything that is not a plain path inside the repository.
+ */
+export function normalizeRepoPath(raw: string): string {
+  const path = raw.trim().replace(/^\.\//, "");
+  const segments = path.split("/");
+  if (
+    path.length === 0 ||
+    path.startsWith("/") ||
+    path.includes("\\") ||
+    path.includes("\0") ||
+    segments.some((s) => s === "" || s === "." || s === "..") ||
+    segments[0] === ".git"
+  ) {
+    throw new Error(`Invalid repository path: "${raw}"`);
+  }
+  return path;
+}
+
+export type PathVerdict = "allowed" | "protected" | "not_allowed";
+
+/**
+ * Decides whether policy lets an agent modify a path. Protected patterns also
+ * match dotfiles; allowed patterns do not, so the stricter reading wins.
+ */
+export function checkPathPolicy(path: string, policy: PolicyConfig): PathVerdict {
+  if (policy.paths.protected.some((p) => minimatch(path, p, { dot: true }))) {
+    return "protected";
+  }
+  return policy.paths.allowed.some((p) => minimatch(path, p))
+    ? "allowed"
+    : "not_allowed";
+}
+
+export interface ChangedFile {
+  filename: string;
+  additions: number;
+  deletions: number;
+}
+
+/**
+ * Checks the files a pull request actually changes against policy. Unlike
+ * ScopeValidator this uses what GitHub reports, not what the agent says it did.
+ */
+export function validateChangedFiles(
+  files: ChangedFile[],
+  policy: PolicyConfig
+): ValidationResult {
+  const errors: ValidationError[] = [];
+
+  for (const file of files) {
+    const verdict = checkPathPolicy(file.filename, policy);
+    if (verdict === "protected") {
+      errors.push({
+        code: "PROTECTED_PATH",
+        message: `Pull request modifies protected path: ${file.filename}`,
+        severity: "error",
+        details: { path: file.filename },
+      });
+    } else if (verdict === "not_allowed") {
+      errors.push({
+        code: "OUT_OF_SCOPE_PATH",
+        message: `Pull request modifies a path outside the allowed set: ${file.filename}`,
+        severity: "error",
+        details: { path: file.filename },
+      });
+    }
+  }
+
+  const linesChanged = files.reduce(
+    (sum, f) => sum + f.additions + f.deletions,
+    0
+  );
+  if (linesChanged > policy.thresholds.max_diff_lines) {
+    errors.push({
+      code: "DIFF_TOO_LARGE",
+      message: `Pull request changes ${linesChanged} lines; the limit is ${policy.thresholds.max_diff_lines}`,
+      severity: "error",
+      details: { actual: linesChanged, max: policy.thresholds.max_diff_lines },
+    });
+  }
+  if (files.length > policy.thresholds.max_files_changed) {
+    errors.push({
+      code: "TOO_MANY_FILES",
+      message: `Pull request changes ${files.length} files; the limit is ${policy.thresholds.max_files_changed}`,
+      severity: "error",
+      details: { actual: files.length, max: policy.thresholds.max_files_changed },
+    });
+  }
+  if (files.length === 0) {
+    errors.push({
+      code: "EMPTY_PULL_REQUEST",
+      message: "Pull request changes no files",
+      severity: "error",
+    });
+  }
+
+  return {
+    valid: errors.length === 0,
+    score: errors.length === 0 ? 1.0 : 0.0,
+    errors,
+    warnings: [],
+  };
+}
