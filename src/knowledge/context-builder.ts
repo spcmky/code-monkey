@@ -67,7 +67,7 @@ export class ContextBuilder {
 
     try {
       // Build repo map if not cached
-      const mapData = await this.repoMap.build(repoPath);
+      await this.repoMap.build(repoPath);
 
       // Find relevant files based on issue content
       const query = `${issue.title} ${issue.body}`;
@@ -101,7 +101,7 @@ export class ContextBuilder {
     }
   }
 
-  private async getSimilarIssues(issue: Issue): Promise<Issue[]> {
+  private async getSimilarIssues(_issue: Issue): Promise<Issue[]> {
     // TODO: use embedding similarity search
     // For now, return empty — will be populated when history grows
     return [];

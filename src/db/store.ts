@@ -12,13 +12,6 @@ import { z } from "zod";
 
 const { Pool } = pg;
 
-const ALLOWED_ACTION_COLUMNS = new Set([
-  "status",
-  "output_data",
-  "completed_at",
-  "error_message",
-]);
-
 const ActionUpdateSchema = z.object({
   status: z.enum(["pending", "running", "completed", "failed"]).optional(),
   output: z.record(z.unknown()).optional(),

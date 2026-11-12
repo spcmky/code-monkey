@@ -15,7 +15,6 @@ import { PolicyEngine } from "./policy.js";
 import {
   createTransition,
   clearTransitionHistory,
-  getNextState,
 } from "./state-machine.js";
 import { ContextBuilder } from "../knowledge/context-builder.js";
 import type {

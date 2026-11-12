@@ -4,7 +4,7 @@ import {
   type BedrockTool,
   type BedrockInvokeResult,
 } from "../tools/bedrock.js";
-import type { AgentContext, AgentResult, AgentType, ToolCall } from "../types/index.js";
+import type { AgentContext, AgentResult, AgentType } from "../types/index.js";
 import logger from "../logger.js";
 
 export abstract class BaseAgent {

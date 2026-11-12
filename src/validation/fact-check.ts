@@ -17,7 +17,7 @@ export class FactChecker {
    */
   async validate(
     result: AgentResult,
-    groundTruth: string
+    _groundTruth: string
   ): Promise<ValidationResult> {
     const errors: ValidationError[] = [];
     const warnings: string[] = [];
