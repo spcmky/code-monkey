@@ -6,6 +6,7 @@ import type {
   AgentAction,
   AuditLogEntry,
   IssueState,
+  StateTransition,
 } from "../types/index.js";
 import { runMigrations } from "./migrations.js";
 import { z } from "zod";
@@ -90,11 +91,6 @@ export class Store {
         title = EXCLUDED.title,
         body = EXCLUDED.body,
         labels = EXCLUDED.labels,
-        state = EXCLUDED.state,
-        classification = EXCLUDED.classification,
-        confidence = EXCLUDED.confidence,
-        priority = EXCLUDED.priority,
-        assigned_agent = EXCLUDED.assigned_agent,
         github_updated_at = EXCLUDED.github_updated_at
     `;
     await this.pool.query(query, [
@@ -162,10 +158,85 @@ export class Store {
     return this.rowToIssue(result.rows[0]);
   }
 
-  async updateIssueState(id: string, state: IssueState): Promise<void> {
+  /**
+   * Moves an issue from one state to another and records the transition, in
+   * one transaction. Returns false (and changes nothing) when the issue is no
+   * longer in `from`, which means another worker or a duplicate message got
+   * there first.
+   */
+  async transitionIssue(
+    id: string,
+    transition: StateTransition,
+    reason?: string
+  ): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const updated = await client.query(
+        `UPDATE issues
+         SET state = $1::varchar,
+             escalation_reason = CASE WHEN $1::varchar = 'ESCALATED' THEN $4::text ELSE escalation_reason END
+         WHERE id = $2 AND state = $3 AND deleted_at IS NULL`,
+        [transition.to, id, transition.from, reason ?? null]
+      );
+      if (updated.rowCount === 0) {
+        await client.query("ROLLBACK");
+        logger.warn(`transitionIssue: issue ${id} is not in state ${transition.from}`, {
+          to: transition.to,
+          trigger: transition.trigger,
+        });
+        return false;
+      }
+      await client.query(
+        `INSERT INTO state_transitions (issue_id, from_state, to_state, triggered_by, reason, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          id,
+          transition.from,
+          transition.to,
+          transition.agentType ?? "controller",
+          reason ?? transition.trigger,
+          JSON.stringify({ trigger: transition.trigger }),
+        ]
+      );
+      await client.query("COMMIT");
+      return true;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Counts reviewer change requests since the issue was last assigned, so a
+   * human re-assigning an escalated issue starts a fresh review budget.
+   */
+  async countReviewCycles(id: string): Promise<number> {
+    const result = await this.pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM state_transitions
+       WHERE issue_id = $1
+         AND from_state = 'UNDER_REVIEW'
+         AND to_state = 'IN_PROGRESS'
+         AND created_at > COALESCE(
+           (SELECT MAX(created_at) FROM state_transitions
+            WHERE issue_id = $1 AND to_state = 'ASSIGNED'),
+           '-infinity'::timestamptz
+         )`,
+      [id]
+    );
+    return (result.rows[0]?.count as number | undefined) ?? 0;
+  }
+
+  async updateIssueTriage(
+    id: string,
+    triage: { classification: string; priority: string }
+  ): Promise<void> {
     await this.pool.query(
-      "UPDATE issues SET state = $1, updated_at = NOW() WHERE id = $2",
-      [state, id]
+      "UPDATE issues SET classification = $1, priority = $2 WHERE id = $3",
+      [triage.classification, triage.priority, id]
     );
   }
 

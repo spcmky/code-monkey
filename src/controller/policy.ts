@@ -19,6 +19,12 @@ export class PolicyEngine {
     });
   }
 
+  hasEscalationLabel(issue: Issue): boolean {
+    return issue.labels.some((l) =>
+      this.config.scope.escalate_labels.includes(l)
+    );
+  }
+
   canHandle(issue: Issue): boolean {
     // Check auto-close labels (equivalent to old excludedLabels)
     const hasAutoClose = issue.labels.some((l) =>
@@ -29,11 +35,7 @@ export class PolicyEngine {
       return false;
     }
 
-    // Check if issue has an escalation label
-    const hasEscalateLabel = issue.labels.some((l) =>
-      this.config.scope.escalate_labels.includes(l)
-    );
-    if (hasEscalateLabel) {
+    if (this.hasEscalationLabel(issue)) {
       logger.debug(`Issue ${issue.id} has escalation label`);
       return false;
     }

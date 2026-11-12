@@ -329,3 +329,23 @@ export const TaskMessageSchema = z.object({
   }),
   createdAt: z.string(),
 });
+
+// Results arrive from workers over SQS, so they are validated before the
+// controller acts on them.
+export const AgentResultSchema = z.object({
+  success: z.boolean(),
+  agentType: z.enum(["triage", "coder", "reviewer"]),
+  issueId: z.string().min(1),
+  output: z.record(z.unknown()),
+  reasoning: z.string(),
+  toolCalls: z.array(
+    z.object({
+      name: z.string(),
+      input: z.record(z.unknown()),
+      output: z.record(z.unknown()),
+      durationMs: z.number(),
+    })
+  ),
+  tokensUsed: z.number(),
+  durationMs: z.number(),
+});
