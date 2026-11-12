@@ -1,9 +1,9 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   isValidTransition,
   getValidNextStates,
   createTransition,
-  clearTransitionHistory,
+  MAX_REVIEW_CYCLES,
   getNextState,
 } from "./state-machine.js";
 
@@ -41,34 +41,38 @@ describe("createTransition", () => {
     );
   });
 
-  it("forces escalation after the review cycle limit", () => {
-    const issueId = "loop-issue";
-    clearTransitionHistory(issueId);
-    vi.useFakeTimers();
-    try {
-      const requestChanges = () => {
-        // Step past the 5s duplicate-suppression window
-        vi.advanceTimersByTime(10_000);
-        return createTransition(
-          "UNDER_REVIEW",
-          "IN_PROGRESS",
-          "review_changes_requested",
-          "reviewer",
-          issueId
-        );
-      };
+  it("allows a review cycle below the limit", () => {
+    const t = createTransition(
+      "UNDER_REVIEW",
+      "IN_PROGRESS",
+      "review_changes_requested",
+      "reviewer",
+      MAX_REVIEW_CYCLES - 1
+    );
+    expect(t.to).toBe("IN_PROGRESS");
+  });
 
-      for (let cycle = 0; cycle < 3; cycle++) {
-        expect(requestChanges().to).toBe("IN_PROGRESS");
-      }
+  it("forces escalation once the review cycle limit is reached", () => {
+    const t = createTransition(
+      "UNDER_REVIEW",
+      "IN_PROGRESS",
+      "review_changes_requested",
+      "reviewer",
+      MAX_REVIEW_CYCLES
+    );
+    expect(t.to).toBe("ESCALATED");
+    expect(t.trigger).toBe("loop_detection_escalation");
+  });
 
-      const forced = requestChanges();
-      expect(forced.to).toBe("ESCALATED");
-      expect(forced.trigger).toBe("loop_detection_escalation");
-    } finally {
-      vi.useRealTimers();
-      clearTransitionHistory(issueId);
-    }
+  it("does not apply the cycle limit to other transitions", () => {
+    const t = createTransition(
+      "UNDER_REVIEW",
+      "VALIDATED",
+      "review_approved",
+      "reviewer",
+      MAX_REVIEW_CYCLES + 5
+    );
+    expect(t.to).toBe("VALIDATED");
   });
 });
 

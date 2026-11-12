@@ -69,6 +69,8 @@ export interface Issue {
   confidence?: number;
   priority?: Priority;
   assignedAgent?: AgentType;
+  /** Task id of the agent work this issue is waiting on, if any. */
+  currentTaskId?: string;
   createdAt: Date;
   updatedAt: Date;
   url: string;
@@ -94,6 +96,8 @@ export interface AgentAction {
 }
 
 export interface AgentResult {
+  /** The task this result answers. Absent for agents run in-process. */
+  taskId?: string;
   success: boolean;
   agentType: AgentType;
   issueId: string;
@@ -328,4 +332,25 @@ export const TaskMessageSchema = z.object({
     }),
   }),
   createdAt: z.string(),
+});
+
+// Results arrive from workers over SQS, so they are validated before the
+// controller acts on them.
+export const AgentResultSchema = z.object({
+  taskId: z.string().min(1),
+  success: z.boolean(),
+  agentType: z.enum(["triage", "coder", "reviewer"]),
+  issueId: z.string().min(1),
+  output: z.record(z.unknown()),
+  reasoning: z.string(),
+  toolCalls: z.array(
+    z.object({
+      name: z.string(),
+      input: z.record(z.unknown()),
+      output: z.record(z.unknown()),
+      durationMs: z.number(),
+    })
+  ),
+  tokensUsed: z.number(),
+  durationMs: z.number(),
 });

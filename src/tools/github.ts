@@ -130,7 +130,7 @@ export class GitHubClient {
     await this.rateLimit();
     return withRetry(async () => {
       const kit = await this.getOctokit();
-      const response = await kit.issues.listForRepo({
+      const data = await kit.paginate(kit.issues.listForRepo, {
         owner,
         repo,
         state: options?.state ?? "open",
@@ -138,7 +138,7 @@ export class GitHubClient {
         per_page: 100,
       });
 
-      return response.data
+      return data
         .filter((issue) => !issue.pull_request)
         .map((issue) => ({
           id: issue.id,

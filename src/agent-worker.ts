@@ -88,7 +88,8 @@ async function main(): Promise<void> {
           await sqs.send(
             new SendMessageCommand({
               QueueUrl: config.aws.sqsResultQueueUrl,
-              MessageBody: JSON.stringify(result),
+              // taskId lets the controller match the result to its dispatch
+              MessageBody: JSON.stringify({ ...result, taskId: task.taskId }),
               MessageAttributes: {
                 taskId: {
                   DataType: "String",

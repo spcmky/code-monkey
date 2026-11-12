@@ -17,7 +17,8 @@
     "worker:dev": "tsx watch src/agent-worker.ts"
   },
   "dependencies": {
-    "@anthropic-ai/bedrock-sdk": "^0.11.0",
+    "@anthropic-ai/bedrock-sdk": "^1.1.2",
+    "@anthropic-ai/sdk": "^1.8.0",
     "@aws-sdk/client-bedrock-runtime": "^3.700.0",
     "@aws-sdk/client-secrets-manager": "^3.700.0",
     "@aws-sdk/client-sns": "^3.700.0",

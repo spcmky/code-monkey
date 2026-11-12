@@ -68,7 +68,11 @@ export class WatcherAgent {
             ghIssue.number
           );
           if (existing) {
-            // TODO: check if issue was updated since last check
+            // Pick up edits and label changes; pipeline state is preserved
+            if (new Date(ghIssue.updatedAt) > existing.updatedAt) {
+              await this.store.upsertIssue(this.toIssue(repoFull, ghIssue));
+              logger.debug(`Issue refreshed: ${repoFull}#${ghIssue.number}`);
+            }
             continue;
           }
 

@@ -1,52 +1,7 @@
 import { IssueState, type StateTransition, type AgentType } from "../types/index.js";
 import logger from "../logger.js";
 
-const MAX_REVIEW_CYCLES = 3;
-
-// Track transition counts per issue to detect loops
-const transitionCounts = new Map<string, Map<string, number>>();
-// Track recent transitions for deduplication (key -> timestamp in seconds)
-const recentTransitions = new Map<string, number>();
-
-function trackTransition(issueId: string, from: string, to: string): void {
-  if (!transitionCounts.has(issueId)) {
-    transitionCounts.set(issueId, new Map());
-  }
-
-  // Deduplication: skip if same transition was tracked within last 5 seconds
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const dedupeKey = `${issueId}:${from}->${to}`;
-  const lastSeen = recentTransitions.get(dedupeKey);
-  if (lastSeen !== undefined && nowSeconds - lastSeen < 5) {
-    logger.debug("Duplicate transition suppressed", { issueId, from, to });
-    return;
-  }
-  recentTransitions.set(dedupeKey, nowSeconds);
-
-  const counts = transitionCounts.get(issueId)!;
-  const key = `${from}->${to}`;
-  counts.set(key, (counts.get(key) ?? 0) + 1);
-}
-
-function detectLoop(issueId: string, from: string, to: string): boolean {
-  const counts = transitionCounts.get(issueId);
-  if (!counts) return false;
-
-  // Check IN_PROGRESS -> UNDER_REVIEW -> IN_PROGRESS cycle
-  const reviewToProgress = counts.get(`${IssueState.UNDER_REVIEW}->${IssueState.IN_PROGRESS}`) ?? 0;
-  if (
-    from === IssueState.UNDER_REVIEW &&
-    to === IssueState.IN_PROGRESS &&
-    reviewToProgress >= MAX_REVIEW_CYCLES
-  ) {
-    return true;
-  }
-  return false;
-}
-
-export function clearTransitionHistory(issueId: string): void {
-  transitionCounts.delete(issueId);
-}
+export const MAX_REVIEW_CYCLES = 3;
 
 const VALID_TRANSITIONS: Record<string, string[]> = {
   [IssueState.DETECTED]: [IssueState.TRIAGED, IssueState.ESCALATED],
@@ -94,12 +49,20 @@ export function getValidNextStates(state: IssueState): IssueState[] {
   return (VALID_TRANSITIONS[state] ?? []) as IssueState[];
 }
 
+/**
+ * Validates a requested transition and returns the one that should be applied.
+ *
+ * `reviewCycles` is the number of UNDER_REVIEW -> IN_PROGRESS transitions the
+ * issue has already been through. Once it reaches MAX_REVIEW_CYCLES a further
+ * request for changes is turned into an escalation, so callers must persist
+ * the returned `to` state rather than the one they asked for.
+ */
 export function createTransition(
   from: IssueState,
   to: IssueState,
   trigger: string,
   agentType?: AgentType,
-  issueId?: string
+  reviewCycles = 0
 ): StateTransition {
   if (!isValidTransition(from, to)) {
     throw new Error(
@@ -107,23 +70,21 @@ export function createTransition(
     );
   }
 
-  // Detect and prevent infinite review loops
-  if (issueId) {
-    if (detectLoop(issueId, from, to)) {
-      logger.warn(
-        `Loop detected for issue ${issueId}: ${from} -> ${to} exceeded ${MAX_REVIEW_CYCLES} cycles, forcing escalation`
-      );
-      // Force escalation instead of the requested transition
-      trackTransition(issueId, from, IssueState.ESCALATED);
-      return {
-        from,
-        to: IssueState.ESCALATED,
-        trigger: "loop_detection_escalation",
-        agentType,
-        timestamp: new Date(),
-      };
-    }
-    trackTransition(issueId, from, to);
+  if (
+    from === IssueState.UNDER_REVIEW &&
+    to === IssueState.IN_PROGRESS &&
+    reviewCycles >= MAX_REVIEW_CYCLES
+  ) {
+    logger.warn(
+      `Review loop limit reached: ${reviewCycles} cycles (max ${MAX_REVIEW_CYCLES}), forcing escalation`
+    );
+    return {
+      from,
+      to: IssueState.ESCALATED,
+      trigger: "loop_detection_escalation",
+      agentType,
+      timestamp: new Date(),
+    };
   }
 
   logger.info(`State transition: ${from} -> ${to}`, { trigger, agentType });
@@ -141,7 +102,6 @@ export function getNextState(
   current: IssueState,
   event: string
 ): IssueState | null {
-  // TODO: expand event-to-state mapping as needed
   const eventMap: Record<string, Record<string, IssueState>> = {
     triage_complete: {
       [IssueState.DETECTED]: IssueState.TRIAGED,
