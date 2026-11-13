@@ -3,12 +3,18 @@ import type { AgentResult, ValidationResult, ValidationError } from "../types/in
 import logger from "../logger.js";
 
 export class FactChecker {
-  private bedrock: BedrockClient;
+  private bedrock: Pick<BedrockClient, "applyGuardrail">;
   private confidenceThreshold: number;
+  private requireGuardrail: boolean;
 
-  constructor(bedrock: BedrockClient, confidenceThreshold: number = 0.7) {
+  constructor(
+    bedrock: Pick<BedrockClient, "applyGuardrail">,
+    confidenceThreshold: number = 0.7,
+    requireGuardrail: boolean = true
+  ) {
     this.bedrock = bedrock;
     this.confidenceThreshold = confidenceThreshold;
+    this.requireGuardrail = requireGuardrail;
   }
 
   /**
@@ -17,7 +23,7 @@ export class FactChecker {
    */
   async validate(
     result: AgentResult,
-    _groundTruth: string
+    _groundTruth: string = ""
   ): Promise<ValidationResult> {
     const errors: ValidationError[] = [];
     const warnings: string[] = [];
@@ -30,6 +36,20 @@ export class FactChecker {
 
     // Apply guardrail to the agent's reasoning
     const guardrailResult = await this.bedrock.applyGuardrail(result.reasoning);
+
+    // Fail closed: an unchecked result is not a passed result
+    if (guardrailResult.action === "NOT_CONFIGURED") {
+      if (this.requireGuardrail) {
+        errors.push({
+          code: "GUARDRAIL_NOT_CONFIGURED",
+          message:
+            "No Bedrock Guardrail is configured, so the fact check could not run",
+          severity: "error",
+        });
+      } else {
+        warnings.push("Fact check skipped: no Bedrock Guardrail configured");
+      }
+    }
 
     if (guardrailResult.action === "BLOCKED") {
       errors.push({

@@ -15,8 +15,11 @@ import { Store } from "../db/store.js";
 import { PolicyEngine } from "./policy.js";
 import { createTransition, isValidTransition } from "./state-machine.js";
 import { ContextBuilder } from "../knowledge/context-builder.js";
-import { ScopeValidator } from "../validation/scope.js";
+import { validateChangedFiles } from "../validation/scope.js";
+import { FactChecker } from "../validation/fact-check.js";
+import { branchForIssue } from "../tools/executor.js";
 import { AgentResultSchema } from "../types/index.js";
+import { z } from "zod";
 import type {
   Issue,
   AgentResult,
@@ -34,7 +37,11 @@ export interface ControllerDeps {
   watcher: Pick<WatcherAgent, "poll">;
   triageAgent: Pick<TriageAgent, "run">;
   notifier: Pick<NotifierAgent, "notifyEscalation">;
-  github: Pick<GitHubClient, "createComment">;
+  github: Pick<
+    GitHubClient,
+    "createComment" | "listPRFiles" | "mergePR" | "isMerged"
+  >;
+  factChecker: Pick<FactChecker, "validate">;
   policy: PolicyEngine;
   contextBuilder: Pick<ContextBuilder, "build">;
   sqs: Pick<SQSClient, "send">;
@@ -50,7 +57,7 @@ const EXPECTED_STATE: Partial<Record<AgentType, IssueState>> = {
 
 // States where the controller may owe the next step. The poll loop re-reads
 // all of them every cycle, so a hand-off interrupted by an error or a restart
-// is picked up again. VALIDATED is absent until the merge step exists.
+// is picked up again.
 const RESUMABLE_STATES: IssueState[] = [
   "DETECTED",
   "TRIAGED",
@@ -58,7 +65,23 @@ const RESUMABLE_STATES: IssueState[] = [
   "IMPLEMENTED",
   "IN_PROGRESS",
   "UNDER_REVIEW",
+  "VALIDATED",
 ];
+
+// What a coder result must say about the pull request it opened
+const CoderPullRequestSchema = z.object({
+  prNumber: z.number().int().positive(),
+  prUrl: z.string().default(""),
+  branch: z.string().min(1),
+});
+
+const MAX_REVIEW_COMMENT_CHARS = 6_000;
+
+// Receives of one result message before the controller gives up on it and
+// escalates the issue. Must not exceed the result queue's maxReceiveCount
+// (tofu/modules/messaging, default 3), or the message reaches the DLQ first
+// and the issue is left waiting on a task that will never report.
+const RESULT_MAX_ATTEMPTS = 3;
 
 const REVIEW_LOOP_REASON = "Review loop limit reached";
 
@@ -72,7 +95,7 @@ export class Controller {
   private sqs: ControllerDeps["sqs"];
   private store: Store;
   private config: AppConfig;
-  private scopeValidator = new ScopeValidator();
+  private factChecker: ControllerDeps["factChecker"];
   private polling = false;
 
   constructor(
@@ -83,7 +106,8 @@ export class Controller {
     this.config = config;
     this.store = store;
 
-    const needsBedrock = !deps.triageAgent || !deps.contextBuilder;
+    const needsBedrock =
+      !deps.triageAgent || !deps.contextBuilder || !deps.factChecker;
     const bedrock = needsBedrock
       ? new BedrockClient({
           region: config.aws.region,
@@ -110,6 +134,14 @@ export class Controller {
     this.triageAgent = deps.triageAgent ?? new TriageAgent(bedrock!);
     this.contextBuilder =
       deps.contextBuilder ?? new ContextBuilder(bedrock!, this.store);
+
+    this.factChecker =
+      deps.factChecker ??
+      new FactChecker(
+        bedrock!,
+        this.policy.getConfidenceThreshold(),
+        config.requireGuardrail
+      );
 
     this.notifier =
       deps.notifier ??
@@ -190,6 +222,10 @@ export class Controller {
         break;
       case "UNDER_REVIEW":
         if (!issue.currentTaskId) await this.dispatch(issue, "reviewer");
+        break;
+      case "VALIDATED":
+        // Without auto-merge a human merges; nothing is owed here
+        if (this.policy.getPolicy().merge.auto_merge) await this.merge(issue);
         break;
       default:
         logger.debug(`No action for issue ${issue.id} in state ${issue.state}`);
@@ -293,7 +329,8 @@ export class Controller {
     to: IssueState,
     trigger: string,
     agentType?: AgentType,
-    reason?: string
+    reason?: string,
+    fields: { reviewFeedback?: string } = {}
   ): Promise<IssueState | null> {
     const reviewCycles =
       issue.state === "UNDER_REVIEW" && to === "IN_PROGRESS"
@@ -314,12 +351,16 @@ export class Controller {
     const applied = await this.store.transitionIssue(
       issue.id,
       transition,
-      forced ? REVIEW_LOOP_REASON : reason
+      forced ? REVIEW_LOOP_REASON : reason,
+      fields
     );
     if (!applied) return null;
 
     issue.state = transition.to;
     issue.currentTaskId = undefined;
+    if (fields.reviewFeedback !== undefined) {
+      issue.reviewFeedback = fields.reviewFeedback;
+    }
     return transition.to;
   }
 
@@ -359,7 +400,6 @@ export class Controller {
     agentOutput: AgentResult,
     issue: Issue
   ): Promise<ValidationResult> {
-    // TODO: add grounding and fact-check once agents run against a checkout
     logger.info(`Validating output from ${agentOutput.agentType}`);
 
     const errors: ValidationError[] = [];
@@ -375,15 +415,44 @@ export class Controller {
       score = 0;
     }
 
-    if (agentOutput.agentType === "coder") {
-      const scope = await this.scopeValidator.validate(
-        agentOutput,
-        this.policy.getPolicy(),
-        { repo: issue.repo, relatedPaths: [] }
-      );
-      errors.push(...scope.errors);
-      warnings.push(...scope.warnings);
-      score = Math.min(score, scope.score);
+    // Scope is judged on what the pull request really changes, as GitHub
+    // reports it, not on what the agent says it wrote.
+    if (agentOutput.agentType === "coder" && agentOutput.success) {
+      const [owner, repo] = issue.repo.split("/");
+      if (!issue.pullRequest || !owner || !repo) {
+        errors.push({
+          code: "NO_PULL_REQUEST",
+          message: "Coder reported success without a usable pull request",
+          severity: "error" as const,
+        });
+        score = 0;
+      } else {
+        const files = await this.listPullRequestFiles(
+          owner,
+          repo,
+          issue.pullRequest.number
+        );
+        if (!files) {
+          errors.push({
+            code: "NO_PULL_REQUEST",
+            message: `Pull request #${issue.pullRequest.number} does not exist`,
+            severity: "error" as const,
+          });
+          score = 0;
+        } else {
+          const scope = validateChangedFiles(files, this.policy.getPolicy());
+          errors.push(...scope.errors);
+          warnings.push(...scope.warnings);
+          score = Math.min(score, scope.score);
+        }
+      }
+    }
+
+    if (agentOutput.success) {
+      const facts = await this.factChecker.validate(agentOutput);
+      errors.push(...facts.errors);
+      warnings.push(...facts.warnings);
+      score = Math.min(score, facts.score);
     }
 
     return {
@@ -394,15 +463,21 @@ export class Controller {
     };
   }
 
+  /** Whether a result answers the task the issue is currently waiting on. */
+  private isCurrent(issue: Issue, result: AgentResult): boolean {
+    const expected = EXPECTED_STATE[result.agentType];
+    return Boolean(
+      expected &&
+        issue.state === expected &&
+        result.taskId &&
+        result.taskId === issue.currentTaskId
+    );
+  }
+
   /** Validates an agent result and advances the issue accordingly. */
   async handleResult(issue: Issue, result: AgentResult): Promise<void> {
-    const expected = EXPECTED_STATE[result.agentType];
-    if (
-      !expected ||
-      issue.state !== expected ||
-      !result.taskId ||
-      result.taskId !== issue.currentTaskId
-    ) {
+    if (!this.isCurrent(issue, result)) {
+      const expected = EXPECTED_STATE[result.agentType];
       logger.warn(`Dropping stale ${result.agentType} result for issue ${issue.id}`, {
         state: issue.state,
         expected,
@@ -410,6 +485,12 @@ export class Controller {
         currentTaskId: issue.currentTaskId,
       });
       return;
+    }
+
+    // Record the pull request before judging it, so an escalation still
+    // points a human at the work.
+    if (result.agentType === "coder") {
+      await this.recordPullRequest(issue, result);
     }
 
     const validation = await this.validate(result, issue);
@@ -447,22 +528,137 @@ export class Controller {
 
     const decision = (result.output as { decision?: string }).decision;
     if (decision === "approve") {
-      // TODO: trigger merge
-      await this.transition(issue, "VALIDATED", "review_approved", "reviewer");
+      const next = await this.transition(
+        issue,
+        "VALIDATED",
+        "review_approved",
+        "reviewer"
+      );
+      if (next !== "VALIDATED") return;
+      if (this.policy.getPolicy().merge.auto_merge) {
+        await this.merge(issue);
+      } else {
+        await this.commentOnPullRequest(
+          issue,
+          "Automated review approved this pull request. It is ready for a human to merge."
+        );
+      }
     } else if (decision === "request_changes") {
+      // The review is stored in the same transaction as the state change, so
+      // every coder run from here on - including one the poll loop starts
+      // after a crash - receives it in its task. Once the transition commits,
+      // a redelivered copy of this result is dropped as stale.
+      const review = this.formatReview(result);
       const next = await this.transition(
         issue,
         "IN_PROGRESS",
         "review_changes_requested",
-        "reviewer"
+        "reviewer",
+        undefined,
+        { reviewFeedback: review }
       );
       if (next === "ESCALATED") {
         await this.announceEscalation(issue, REVIEW_LOOP_REASON, result);
-      } else if (next === "IN_PROGRESS") {
-        await this.startCoder(issue, "review_changes_requested");
+        return;
       }
+      if (next !== "IN_PROGRESS") return;
+
+      // For humans watching the pull request; the coder does not need it
+      await this.commentOnPullRequest(issue, review);
+      await this.startCoder(issue, "review_changes_requested");
     } else {
       await this.escalate(issue, "Reviewer escalated", result);
+    }
+  }
+
+  /**
+   * Stores the pull request a coder result reports. The branch must be the
+   * one the system assigns to the issue, so a result cannot point the
+   * pipeline at some other pull request.
+   */
+  private async recordPullRequest(
+    issue: Issue,
+    result: AgentResult
+  ): Promise<void> {
+    const parsed = CoderPullRequestSchema.safeParse(result.output);
+    if (!parsed.success) return;
+    if (parsed.data.branch !== branchForIssue(issue.number)) {
+      logger.warn(`Ignoring pull request on unexpected branch for issue ${issue.id}`, {
+        branch: parsed.data.branch,
+      });
+      return;
+    }
+    const pr = {
+      number: parsed.data.prNumber,
+      url: parsed.data.prUrl,
+      branch: parsed.data.branch,
+    };
+    await this.store.setIssuePullRequest(issue.id, pr);
+    issue.pullRequest = pr;
+  }
+
+  /** Merges an approved pull request. Only called when policy allows it. */
+  private async merge(issue: Issue): Promise<void> {
+    const [owner, repo] = issue.repo.split("/");
+    const pr = issue.pullRequest;
+    if (!pr || !owner || !repo) {
+      await this.escalate(issue, "Approved issue has no pull request to merge");
+      return;
+    }
+
+    try {
+      // A merge that succeeded before a lost state update must not be retried
+      if (!(await this.github.isMerged(owner, repo, pr.number))) {
+        await this.github.mergePR(
+          owner,
+          repo,
+          pr.number,
+          this.policy.getPolicy().merge.method
+        );
+      }
+    } catch (error) {
+      logger.error(`Automatic merge failed for issue ${issue.id}`, { error });
+      await this.escalate(issue, "Automatic merge failed");
+      return;
+    }
+    await this.transition(issue, "MERGED", "merged");
+  }
+
+  private formatReview(result: AgentResult): string {
+    const output = result.output as {
+      reasoning?: string;
+      comments?: Array<{ path?: string; line?: number; body?: string; severity?: string }>;
+    };
+    const lines = [
+      "Automated review requested changes.",
+      "",
+      output.reasoning ?? result.reasoning,
+      "",
+      ...(output.comments ?? []).map(
+        (c) => `- \`${c.path}:${c.line}\` (${c.severity}): ${c.body}`
+      ),
+    ];
+    return lines.join("\n").slice(0, MAX_REVIEW_COMMENT_CHARS);
+  }
+
+  /**
+   * Comments on the issue's pull request. Best effort: these comments are for
+   * humans, so a failure is logged and nothing else depends on it.
+   */
+  private async commentOnPullRequest(issue: Issue, body: string): Promise<void> {
+    const [owner, repo] = issue.repo.split("/");
+    if (!issue.pullRequest || !owner || !repo) return;
+    try {
+      await this.github.createComment(
+        owner,
+        repo,
+        issue.pullRequest.number,
+        body
+      );
+    } catch (error) {
+      logger.error(`Failed to comment on pull request for issue ${issue.id}`, {
+        error,
+      });
     }
   }
 
@@ -532,12 +728,13 @@ export class Controller {
         QueueUrl: this.config.aws.sqsResultQueueUrl,
         MaxNumberOfMessages: 10,
         WaitTimeSeconds: 1,
+        MessageSystemAttributeNames: ["ApproximateReceiveCount"],
       })
     );
 
     for (const message of response.Messages ?? []) {
+      const result = this.parseResult(message);
       try {
-        const result = this.parseResult(message);
         if (result) {
           const issue = await this.store.getIssue(result.issueId);
           if (issue) {
@@ -550,9 +747,56 @@ export class Controller {
         // cannot succeed.
         await this.deleteResult(message);
       } catch (error) {
-        // Left on the queue for redelivery; the DLQ catches repeat failures
-        logger.error("Failed to process result message", { error });
+        const attempts = Number(message.Attributes?.ApproximateReceiveCount ?? 1);
+        logger.error("Failed to process result message", {
+          error,
+          attempts,
+          issueId: result?.issueId,
+        });
+        // Earlier attempts stay on the queue for redelivery. On the last one,
+        // hand the issue to a human instead of letting the message go to the
+        // DLQ and leaving the issue waiting forever.
+        if (result && attempts >= RESULT_MAX_ATTEMPTS) {
+          await this.abandonResult(message, result);
+        }
       }
+    }
+  }
+
+  /** Escalates the issue a result belongs to, then drops the result. */
+  private async abandonResult(
+    message: Message,
+    result: AgentResult
+  ): Promise<void> {
+    try {
+      const issue = await this.store.getIssue(result.issueId);
+      if (issue && this.isCurrent(issue, result)) {
+        await this.escalate(
+          issue,
+          "Agent result could not be processed after repeated attempts",
+          result
+        );
+      }
+      await this.deleteResult(message);
+    } catch (error) {
+      // Still failing (for example the database is down): the DLQ keeps it
+      logger.error(`Could not abandon result for issue ${result.issueId}`, {
+        error,
+      });
+    }
+  }
+
+  /** Lists a pull request's files, or returns null if it does not exist. */
+  private async listPullRequestFiles(
+    owner: string,
+    repo: string,
+    prNumber: number
+  ): Promise<Awaited<ReturnType<GitHubClient["listPRFiles"]>> | null> {
+    try {
+      return await this.github.listPRFiles(owner, repo, prNumber);
+    } catch (error) {
+      if ((error as { status?: number }).status === 404) return null;
+      throw error;
     }
   }
 

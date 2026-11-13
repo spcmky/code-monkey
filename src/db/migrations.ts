@@ -19,6 +19,7 @@ function loadMigrations(): Migration[] {
     { version: 2, name: "embeddings", file: "002_embeddings.sql" },
     { version: 3, name: "metrics", file: "003_metrics.sql" },
     { version: 4, name: "current_task", file: "004_current_task.sql" },
+    { version: 5, name: "review_feedback", file: "005_review_feedback.sql" },
   ];
 
   return migrationFiles.map(({ version, name, file }) => ({

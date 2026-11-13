@@ -89,3 +89,10 @@ rate_limits:
   max_prs_per_hour: 5
   max_comments_per_hour: 20
   cooldown_after_failure_minutes: 15
+
+# ---------------------------------------------------------------------------
+# Merge — what happens once the reviewer approves a pull request
+# ---------------------------------------------------------------------------
+merge:
+  auto_merge: false   # false: comment that the PR is ready and leave it to a human
+  method: squash      # merge | squash | rebase (used only when auto_merge is true)

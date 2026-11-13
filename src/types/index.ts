@@ -71,9 +71,19 @@ export interface Issue {
   assignedAgent?: AgentType;
   /** Task id of the agent work this issue is waiting on, if any. */
   currentTaskId?: string;
+  /** The latest automated review requesting changes, for the coder's rework. */
+  reviewFeedback?: string;
+  /** The pull request the coder opened for this issue, once there is one. */
+  pullRequest?: PullRequestRef;
   createdAt: Date;
   updatedAt: Date;
   url: string;
+}
+
+export interface PullRequestRef {
+  number: number;
+  url: string;
+  branch: string;
 }
 
 export interface AgentAction {
@@ -146,6 +156,13 @@ export interface PolicyConfig {
   escalation: EscalationConfig;
   auto_close: AutoCloseConfig;
   rate_limits: RateLimitsConfig;
+  merge: MergeConfig;
+}
+
+export interface MergeConfig {
+  /** Merge approved PRs automatically. Off by default: a human merges. */
+  auto_merge: boolean;
+  method: "merge" | "squash" | "rebase";
 }
 
 export interface ScopeConfig {
@@ -250,24 +267,38 @@ export interface AuditLogEntry {
 
 // --- Zod Schemas for runtime validation ---
 
+// zod drops keys a schema does not name, so every Issue field an agent needs
+// has to be listed here.
+const IssueMessageSchema = z.object({
+  id: z.string(),
+  githubId: z.number(),
+  repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+  number: z.number().int().positive(),
+  title: z.string(),
+  body: z.string(),
+  author: z.string().default("unknown"),
+  labels: z.array(z.string()),
+  state: z.string(),
+  currentTaskId: z.string().optional(),
+  reviewFeedback: z.string().optional(),
+  pullRequest: z
+    .object({
+      number: z.number().int().positive(),
+      url: z.string(),
+      branch: z.string(),
+    })
+    .optional(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+  url: z.string(),
+});
+
 export const TaskMessageSchema = z.object({
   taskId: z.string(),
   issueId: z.string(),
   agentType: z.enum(["watcher", "triage", "coder", "reviewer", "notifier"]),
   context: z.object({
-    issue: z.object({
-      id: z.string(),
-      githubId: z.number(),
-      repo: z.string(),
-      number: z.number(),
-      title: z.string(),
-      body: z.string(),
-      labels: z.array(z.string()),
-      state: z.string(),
-      createdAt: z.coerce.date(),
-      updatedAt: z.coerce.date(),
-      url: z.string(),
-    }),
+    issue: IssueMessageSchema,
     relevantFiles: z.array(
       z.object({
         path: z.string(),
@@ -276,19 +307,7 @@ export const TaskMessageSchema = z.object({
       })
     ),
     similarIssues: z.array(
-      z.object({
-        id: z.string(),
-        githubId: z.number(),
-        repo: z.string(),
-        number: z.number(),
-        title: z.string(),
-        body: z.string(),
-        labels: z.array(z.string()),
-        state: z.string(),
-        createdAt: z.coerce.date(),
-        updatedAt: z.coerce.date(),
-        url: z.string(),
-      })
+      IssueMessageSchema
     ),
     repoProfile: z.object({
       name: z.string(),

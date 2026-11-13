@@ -35,6 +35,12 @@ const PolicySchema = z.object({
     max_comments_per_hour: z.number().default(20),
     cooldown_after_failure_minutes: z.number().default(15),
   }),
+  merge: z
+    .object({
+      auto_merge: z.boolean().default(false),
+      method: z.enum(["merge", "squash", "rebase"]).default("squash"),
+    })
+    .default({}),
 });
 
 const AppConfigSchema = z.object({
@@ -58,6 +64,9 @@ const AppConfigSchema = z.object({
     bedrockGuardrailId: z.string().optional(),
     bedrockGuardrailVersion: z.string().default("DRAFT"),
   }),
+  // Without a guardrail the fact check cannot run. Results are then rejected
+  // unless this is explicitly switched off (local development).
+  requireGuardrail: z.boolean().default(true),
   logLevel: z.string().default("info"),
 });
 
@@ -96,6 +105,9 @@ export function loadAppConfig(): AppConfig {
       bedrockGuardrailId: process.env.BEDROCK_GUARDRAIL_ID || undefined,
       bedrockGuardrailVersion: process.env.BEDROCK_GUARDRAIL_VERSION,
     },
+    requireGuardrail: process.env.REQUIRE_GUARDRAIL
+      ? process.env.REQUIRE_GUARDRAIL !== "false"
+      : undefined,
     logLevel: process.env.LOG_LEVEL,
   });
 
