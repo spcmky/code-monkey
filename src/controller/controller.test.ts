@@ -184,7 +184,11 @@ function reviewerResult(decision: string, taskId = "task-1"): AgentResult {
 
 describe("Controller", () => {
   let store: FakeStore;
-  let resultQueue: Array<{ Body: string; ReceiptHandle: string }>;
+  let resultQueue: Array<{
+    Body: string;
+    ReceiptHandle: string;
+    Attributes?: Record<string, string>;
+  }>;
   let sent: Array<{ agentType: string; issueId: string }>;
   let deleted: string[];
   let triageRun: ReturnType<typeof vi.fn>;
@@ -441,6 +445,17 @@ describe("Controller", () => {
       expect(store.issues.get("issue-1")?.state).toBe("ESCALATED");
     });
 
+    it("escalates when the reported pull request does not exist", async () => {
+      listPRFiles.mockRejectedValue(Object.assign(new Error("Not Found"), { status: 404 }));
+      store.add(makeIssue({ state: "IN_PROGRESS" }));
+      enqueue(coderResult({}));
+      await controller.poll();
+
+      expect(store.issues.get("issue-1")?.state).toBe("ESCALATED");
+      expect(store.transitions.at(-1)?.reason).toContain("NO_PULL_REQUEST");
+      expect(deleted).toEqual(["r1"]);
+    });
+
     it("rejects a pull request on a branch the system did not assign", async () => {
       store.add(makeIssue({ state: "IN_PROGRESS" }));
       enqueue({
@@ -549,6 +564,7 @@ describe("Controller", () => {
 
       const body = createComment.mock.calls[0]?.[3] as string;
       expect(createComment.mock.calls[0]?.[2]).toBe(42);
+      expect(body.startsWith("<!-- code-monkey:review -->")).toBe(true);
       expect(body).toContain("Missing null check");
       expect(body).toContain("src/fix.ts:3");
       expect(store.issues.get("issue-1")?.state).toBe("IN_PROGRESS");
@@ -590,6 +606,23 @@ describe("Controller", () => {
       expect(sent).toEqual([]);
       expect(notifyEscalation).toHaveBeenCalledTimes(1);
       expect(store.transitions.at(-1)?.reason).toBe("Review loop limit reached");
+      // No review is posted for a coder that will never run
+      expect(
+        createComment.mock.calls.some((call) =>
+          String(call[3]).includes("<!-- code-monkey:review -->")
+        )
+      ).toBe(false);
+    });
+
+    it("escalates when the review feedback cannot be posted", async () => {
+      createComment.mockRejectedValue(new Error("GitHub unavailable"));
+      store.add(makeIssue({ state: "UNDER_REVIEW", pullRequest: PR }));
+      enqueue(reviewerResult("request_changes"));
+      await controller.poll();
+
+      expect(store.path("issue-1")).toEqual(["IN_PROGRESS", "ESCALATED"]);
+      expect(sent).toEqual([]);
+      expect(deleted).toEqual(["r1"]);
     });
 
     it("escalates on an unknown decision", async () => {
@@ -670,6 +703,36 @@ describe("Controller", () => {
       enqueue(reviewerResult("approve"));
       await controller.poll();
 
+      expect(deleted).toEqual(["r1"]);
+    });
+
+    it("leaves a result that fails to process on the queue for another attempt", async () => {
+      listPRFiles.mockRejectedValue(new Error("GitHub unavailable"));
+      store.add(makeIssue({ state: "IN_PROGRESS" }));
+      resultQueue.push({
+        Body: JSON.stringify(coderResult({})),
+        ReceiptHandle: "r1",
+        Attributes: { ApproximateReceiveCount: "1" },
+      });
+      await controller.poll();
+
+      expect(store.issues.get("issue-1")?.state).toBe("IN_PROGRESS");
+      expect(deleted).toEqual([]);
+    });
+
+    it("escalates and drops a result that still fails on its last attempt", async () => {
+      listPRFiles.mockRejectedValue(new Error("GitHub unavailable"));
+      store.add(makeIssue({ state: "IN_PROGRESS" }));
+      resultQueue.push({
+        Body: JSON.stringify(coderResult({})),
+        ReceiptHandle: "r1",
+        Attributes: { ApproximateReceiveCount: "3" },
+      });
+      await controller.poll();
+
+      expect(store.issues.get("issue-1")?.state).toBe("ESCALATED");
+      expect(store.transitions.at(-1)?.reason).toContain("repeated attempts");
+      expect(notifyEscalation).toHaveBeenCalledTimes(1);
       expect(deleted).toEqual(["r1"]);
     });
 

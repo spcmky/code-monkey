@@ -29,12 +29,21 @@ export type AgentGitHub = Pick<
   | "createPR"
   | "listComments"
   | "listPRFiles"
+  | "updatePR"
+  | "getAuthenticatedLogin"
 >;
 
 const MAX_FILE_CHARS = 200_000;
 const MAX_LISTED_FILES = 2_000;
 const MAX_PATCH_CHARS = 60_000;
-const MAX_FEEDBACK_COMMENTS = 10;
+const MAX_REVIEWS_RETURNED = 3;
+
+/**
+ * Marks a pull request comment as the automated reviewer's feedback. The
+ * marker alone is not trusted - anyone can paste it - so feedback must also
+ * be authored by the account the system acts as.
+ */
+export const REVIEW_MARKER = "<!-- code-monkey:review -->";
 
 function splitRepo(repo: string): { owner: string; name: string } {
   const [owner, name] = repo.split("/");
@@ -62,6 +71,15 @@ export class CoderToolSession implements ToolSession {
   private readonly pending = new Map<string, string>();
   private baseBranch?: string;
   private committed: string[] = [];
+  /** Every path this issue's work changes: staged, committed, or already in its PR. */
+  private readonly touched = new Set<string>();
+  private touchedSeeded = false;
+  /**
+   * True until this session commits. A run with no recorded pull request is a
+   * fresh attempt: its first commit is built on the base branch and replaces
+   * whatever an earlier attempt left on the work branch.
+   */
+  private startFromBase: boolean;
 
   /** Set once this session has opened or updated the pull request. */
   pullRequest?: PullRequestRef;
@@ -75,6 +93,7 @@ export class CoderToolSession implements ToolSession {
     this.repo = name;
     this.branch =
       context.issue.pullRequest?.branch || branchForIssue(context.issue.number);
+    this.startFromBase = !context.issue.pullRequest;
   }
 
   get filesCommitted(): string[] {
@@ -89,7 +108,7 @@ export class CoderToolSession implements ToolSession {
       case "readFile":
         return this.readFile(requireString(input, "path"));
       case "writeFile":
-        return this.writeFile(
+        return await this.writeFile(
           requireString(input, "path"),
           typeof input.content === "string" ? input.content : ""
         );
@@ -117,9 +136,13 @@ export class CoderToolSession implements ToolSession {
     }
   }
 
-  /** The ref to read from: the work branch on a rework, else the base. */
+  /**
+   * The ref to read from: the work branch once it holds this attempt's work
+   * (a rework, or after this session's first commit), else the base branch.
+   * Commits are built on the same ref, so reads always match their parent.
+   */
   private async readRef(): Promise<string> {
-    if (this.context.issue.pullRequest) return this.branch;
+    if (!this.startFromBase) return this.branch;
     return this.base();
   }
 
@@ -147,7 +170,10 @@ export class CoderToolSession implements ToolSession {
       : { path, content };
   }
 
-  private writeFile(rawPath: string, content: string): Record<string, unknown> {
+  private async writeFile(
+    rawPath: string,
+    content: string
+  ): Promise<Record<string, unknown>> {
     const path = normalizeRepoPath(rawPath);
     const verdict = checkPathPolicy(path, this.context.policy);
     if (verdict !== "allowed") {
@@ -158,14 +184,19 @@ export class CoderToolSession implements ToolSession {
       );
     }
 
-    const maxFiles = this.context.policy.thresholds.max_files_changed;
-    if (!this.pending.has(path) && this.pending.size >= maxFiles) {
-      throw new Error(`Cannot modify more than ${maxFiles} files for one issue`);
-    }
     if (content.length > MAX_FILE_CHARS) {
       throw new Error(`${path} is too large to write (${content.length} chars)`);
     }
 
+    // The limit is per issue: files already in the pull request and files
+    // committed earlier in this session count, not just the current batch.
+    await this.seedTouchedFromPullRequest();
+    const maxFiles = this.context.policy.thresholds.max_files_changed;
+    if (!this.touched.has(path) && this.touched.size >= maxFiles) {
+      throw new Error(`Cannot modify more than ${maxFiles} files for one issue`);
+    }
+
+    this.touched.add(path);
     this.pending.set(path, content);
     return { path, staged: true, stagedFiles: this.pending.size };
   }
@@ -183,15 +214,36 @@ export class CoderToolSession implements ToolSession {
     };
   }
 
+  private async seedTouchedFromPullRequest(): Promise<void> {
+    if (this.touchedSeeded) return;
+    const pr = this.context.issue.pullRequest;
+    if (pr && !this.startFromBase) {
+      const files = await this.github.listPRFiles(this.owner, this.repo, pr.number);
+      for (const file of files) this.touched.add(file.filename);
+    }
+    this.touchedSeeded = true;
+  }
+
+  /**
+   * Returns the automated reviewer's feedback only: comments that carry the
+   * review marker and were posted by the account the system acts as. Other
+   * people's comments on the pull request are never passed to the model.
+   */
   private async getReviewFeedback(): Promise<Record<string, unknown>> {
     const pr = this.context.issue.pullRequest;
-    if (!pr) return { comments: [] };
-    const comments = await this.github.listComments(
-      this.owner,
-      this.repo,
-      pr.number
-    );
-    return { comments: comments.slice(-MAX_FEEDBACK_COMMENTS) };
+    if (!pr) return { reviews: [] };
+    const [login, comments] = await Promise.all([
+      this.github.getAuthenticatedLogin(),
+      this.github.listComments(this.owner, this.repo, pr.number),
+    ]);
+    const reviews = comments
+      .filter((c) => c.author === login && c.body.includes(REVIEW_MARKER))
+      .slice(-MAX_REVIEWS_RETURNED)
+      .map((c) => ({
+        postedAt: c.createdAt,
+        feedback: c.body.replace(REVIEW_MARKER, "").trim(),
+      }));
+    return { reviews };
   }
 
   private async createPR(
@@ -211,18 +263,34 @@ export class CoderToolSession implements ToolSession {
       baseBranch: base,
       message: `[code-monkey] ${title} (#${issue.number})`,
       files,
+      startFromBase: this.startFromBase,
     });
+    this.startFromBase = false;
     this.committed.push(...files.map((f) => f.path));
     this.pending.clear();
 
-    const existing =
-      issue.pullRequest ??
-      (await this.github.findOpenPR(this.owner, this.repo, this.branch));
+    const prBody = `${body}\n\nCloses #${issue.number}`;
+    let existing: { number: number; url: string } | undefined =
+      issue.pullRequest;
+    if (!existing) {
+      // An open pull request on the work branch was left by an earlier
+      // attempt. The branch now holds only this attempt's work, so the pull
+      // request is reused and its description replaced to match.
+      existing =
+        (await this.github.findOpenPR(this.owner, this.repo, this.branch)) ??
+        undefined;
+      if (existing) {
+        await this.github.updatePR(this.owner, this.repo, existing.number, {
+          title,
+          body: prBody,
+        });
+      }
+    }
     const pr =
       existing ??
       (await this.github.createPR(this.owner, this.repo, {
         title,
-        body: `${body}\n\nCloses #${issue.number}`,
+        body: prBody,
         head: this.branch,
         base,
       }));

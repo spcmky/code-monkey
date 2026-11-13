@@ -87,7 +87,7 @@ writeFile refuses paths that policy protects or does not allow. If the fix needs
     {
       name: "getReviewFeedback",
       description:
-        "Get reviewer comments on this issue's existing pull request, if there is one",
+        "Get the automated reviewer's requested changes on this issue's existing pull request, if there is one",
       input_schema: { type: "object", properties: {} },
     },
     {

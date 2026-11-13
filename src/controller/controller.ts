@@ -17,7 +17,7 @@ import { createTransition, isValidTransition } from "./state-machine.js";
 import { ContextBuilder } from "../knowledge/context-builder.js";
 import { validateChangedFiles } from "../validation/scope.js";
 import { FactChecker } from "../validation/fact-check.js";
-import { branchForIssue } from "../tools/executor.js";
+import { branchForIssue, REVIEW_MARKER } from "../tools/executor.js";
 import { AgentResultSchema } from "../types/index.js";
 import { z } from "zod";
 import type {
@@ -76,6 +76,12 @@ const CoderPullRequestSchema = z.object({
 });
 
 const MAX_REVIEW_COMMENT_CHARS = 6_000;
+
+// Receives of one result message before the controller gives up on it and
+// escalates the issue. Must not exceed the result queue's maxReceiveCount
+// (tofu/modules/messaging, default 3), or the message reaches the DLQ first
+// and the issue is left waiting on a task that will never report.
+const RESULT_MAX_ATTEMPTS = 3;
 
 const REVIEW_LOOP_REASON = "Review loop limit reached";
 
@@ -416,15 +422,24 @@ export class Controller {
         });
         score = 0;
       } else {
-        const files = await this.github.listPRFiles(
+        const files = await this.listPullRequestFiles(
           owner,
           repo,
           issue.pullRequest.number
         );
-        const scope = validateChangedFiles(files, this.policy.getPolicy());
-        errors.push(...scope.errors);
-        warnings.push(...scope.warnings);
-        score = Math.min(score, scope.score);
+        if (!files) {
+          errors.push({
+            code: "NO_PULL_REQUEST",
+            message: `Pull request #${issue.pullRequest.number} does not exist`,
+            severity: "error" as const,
+          });
+          score = 0;
+        } else {
+          const scope = validateChangedFiles(files, this.policy.getPolicy());
+          errors.push(...scope.errors);
+          warnings.push(...scope.warnings);
+          score = Math.min(score, scope.score);
+        }
       }
     }
 
@@ -443,15 +458,21 @@ export class Controller {
     };
   }
 
+  /** Whether a result answers the task the issue is currently waiting on. */
+  private isCurrent(issue: Issue, result: AgentResult): boolean {
+    const expected = EXPECTED_STATE[result.agentType];
+    return Boolean(
+      expected &&
+        issue.state === expected &&
+        result.taskId &&
+        result.taskId === issue.currentTaskId
+    );
+  }
+
   /** Validates an agent result and advances the issue accordingly. */
   async handleResult(issue: Issue, result: AgentResult): Promise<void> {
-    const expected = EXPECTED_STATE[result.agentType];
-    if (
-      !expected ||
-      issue.state !== expected ||
-      !result.taskId ||
-      result.taskId !== issue.currentTaskId
-    ) {
+    if (!this.isCurrent(issue, result)) {
+      const expected = EXPECTED_STATE[result.agentType];
       logger.warn(`Dropping stale ${result.agentType} result for issue ${issue.id}`, {
         state: issue.state,
         expected,
@@ -518,8 +539,9 @@ export class Controller {
         );
       }
     } else if (decision === "request_changes") {
-      // Posted first: the coder reads its feedback from the pull request
-      await this.commentOnPullRequest(issue, this.formatReview(result), true);
+      // State first, like every other side effect: once the transition
+      // commits, a redelivered copy of this result is dropped as stale, so
+      // the review is posted at most once.
       const next = await this.transition(
         issue,
         "IN_PROGRESS",
@@ -528,9 +550,22 @@ export class Controller {
       );
       if (next === "ESCALATED") {
         await this.announceEscalation(issue, REVIEW_LOOP_REASON, result);
-      } else if (next === "IN_PROGRESS") {
-        await this.startCoder(issue, "review_changes_requested");
+        return;
       }
+      if (next !== "IN_PROGRESS") return;
+
+      // The coder reads this feedback from the pull request, so without it
+      // a rework run would be blind.
+      try {
+        await this.commentOnPullRequest(issue, this.formatReview(result), true);
+      } catch (error) {
+        logger.error(`Failed to post review feedback for issue ${issue.id}`, {
+          error,
+        });
+        await this.escalate(issue, "Could not post review feedback", result);
+        return;
+      }
+      await this.startCoder(issue, "review_changes_requested");
     } else {
       await this.escalate(issue, "Reviewer escalated", result);
     }
@@ -595,6 +630,7 @@ export class Controller {
       comments?: Array<{ path?: string; line?: number; body?: string; severity?: string }>;
     };
     const lines = [
+      REVIEW_MARKER,
       "Automated review requested changes.",
       "",
       output.reasoning ?? result.reasoning,
@@ -698,12 +734,13 @@ export class Controller {
         QueueUrl: this.config.aws.sqsResultQueueUrl,
         MaxNumberOfMessages: 10,
         WaitTimeSeconds: 1,
+        MessageSystemAttributeNames: ["ApproximateReceiveCount"],
       })
     );
 
     for (const message of response.Messages ?? []) {
+      const result = this.parseResult(message);
       try {
-        const result = this.parseResult(message);
         if (result) {
           const issue = await this.store.getIssue(result.issueId);
           if (issue) {
@@ -716,9 +753,56 @@ export class Controller {
         // cannot succeed.
         await this.deleteResult(message);
       } catch (error) {
-        // Left on the queue for redelivery; the DLQ catches repeat failures
-        logger.error("Failed to process result message", { error });
+        const attempts = Number(message.Attributes?.ApproximateReceiveCount ?? 1);
+        logger.error("Failed to process result message", {
+          error,
+          attempts,
+          issueId: result?.issueId,
+        });
+        // Earlier attempts stay on the queue for redelivery. On the last one,
+        // hand the issue to a human instead of letting the message go to the
+        // DLQ and leaving the issue waiting forever.
+        if (result && attempts >= RESULT_MAX_ATTEMPTS) {
+          await this.abandonResult(message, result);
+        }
       }
+    }
+  }
+
+  /** Escalates the issue a result belongs to, then drops the result. */
+  private async abandonResult(
+    message: Message,
+    result: AgentResult
+  ): Promise<void> {
+    try {
+      const issue = await this.store.getIssue(result.issueId);
+      if (issue && this.isCurrent(issue, result)) {
+        await this.escalate(
+          issue,
+          "Agent result could not be processed after repeated attempts",
+          result
+        );
+      }
+      await this.deleteResult(message);
+    } catch (error) {
+      // Still failing (for example the database is down): the DLQ keeps it
+      logger.error(`Could not abandon result for issue ${result.issueId}`, {
+        error,
+      });
+    }
+  }
+
+  /** Lists a pull request's files, or returns null if it does not exist. */
+  private async listPullRequestFiles(
+    owner: string,
+    repo: string,
+    prNumber: number
+  ): Promise<Awaited<ReturnType<GitHubClient["listPRFiles"]>> | null> {
+    try {
+      return await this.github.listPRFiles(owner, repo, prNumber);
+    } catch (error) {
+      if ((error as { status?: number }).status === 404) return null;
+      throw error;
     }
   }
 

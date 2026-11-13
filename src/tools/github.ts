@@ -58,6 +58,7 @@ export class GitHubClient {
   private secretArn: string;
   private region: string;
   private requestTimestamps: number[] = [];
+  private login?: string;
 
   constructor(config: { secretArn: string; region: string }) {
     if (!ARN_REGEX.test(config.secretArn)) {
@@ -383,6 +384,12 @@ export class GitHubClient {
       baseBranch: string;
       message: string;
       files: Array<{ path: string; content: string }>;
+      /**
+       * Build on the base branch even if the work branch already exists, and
+       * reset the work branch to the new commit. Used for a fresh attempt, so
+       * commits left by an earlier attempt do not leak into it.
+       */
+      startFromBase?: boolean;
     }
   ): Promise<{ sha: string }> {
     await this.rateLimit();
@@ -390,7 +397,9 @@ export class GitHubClient {
 
     const branchSha = await this.getBranchSha(owner, repo, params.branch);
     const parentSha =
-      branchSha ?? (await this.getBranchSha(owner, repo, params.baseBranch));
+      branchSha && !params.startFromBase
+        ? branchSha
+        : await this.getBranchSha(owner, repo, params.baseBranch);
     if (!parentSha) {
       throw new Error(`Base branch ${params.baseBranch} not found`);
     }
@@ -425,6 +434,8 @@ export class GitHubClient {
         repo,
         ref: `heads/${params.branch}`,
         sha: commit.sha,
+        // A fresh attempt replaces the branch; otherwise only fast-forward
+        force: Boolean(params.startFromBase),
       });
     } else {
       await kit.git.createRef({
@@ -448,6 +459,38 @@ export class GitHubClient {
       if ((error as { status?: number }).status === 404) return false;
       throw error;
     }
+  }
+
+  async updatePR(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    params: { title: string; body: string }
+  ): Promise<void> {
+    await this.rateLimit();
+    await withRetry(async () => {
+      const kit = await this.getOctokit();
+      await kit.pulls.update({
+        owner,
+        repo,
+        pull_number: prNumber,
+        title: params.title,
+        body: params.body,
+      });
+    }, `updatePR(${owner}/${repo}#${prNumber})`);
+  }
+
+  /** The login of the account this client acts as (the PAT's owner). */
+  async getAuthenticatedLogin(): Promise<string> {
+    if (this.login) return this.login;
+    await this.rateLimit();
+    const login = await withRetry(async () => {
+      const kit = await this.getOctokit();
+      const { data } = await kit.users.getAuthenticated();
+      return data.login;
+    }, "getAuthenticatedLogin");
+    this.login = login;
+    return login;
   }
 
   /** Finds the open PR whose head is the given branch, if any. */
