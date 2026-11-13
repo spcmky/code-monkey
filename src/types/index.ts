@@ -71,6 +71,8 @@ export interface Issue {
   assignedAgent?: AgentType;
   /** Task id of the agent work this issue is waiting on, if any. */
   currentTaskId?: string;
+  /** The latest automated review requesting changes, for the coder's rework. */
+  reviewFeedback?: string;
   /** The pull request the coder opened for this issue, once there is one. */
   pullRequest?: PullRequestRef;
   createdAt: Date;
@@ -278,6 +280,7 @@ const IssueMessageSchema = z.object({
   labels: z.array(z.string()),
   state: z.string(),
   currentTaskId: z.string().optional(),
+  reviewFeedback: z.string().optional(),
   pullRequest: z
     .object({
       number: z.number().int().positive(),

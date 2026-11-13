@@ -162,14 +162,16 @@ export class Store {
   /**
    * Moves an issue from one state to another and records the transition, in
    * one transaction. Also clears current_task_id: whatever task the issue was
-   * waiting on belongs to the state it just left. Returns false (and changes nothing) when the issue is no
+   * waiting on belongs to the state it just left. Any `fields` are written in
+   * the same statement, so they commit or fail with the state. Returns false (and changes nothing) when the issue is no
    * longer in `from`, which means another worker or a duplicate message got
    * there first.
    */
   async transitionIssue(
     id: string,
     transition: StateTransition,
-    reason?: string
+    reason?: string,
+    fields: { reviewFeedback?: string } = {}
   ): Promise<boolean> {
     const client = await this.pool.connect();
     try {
@@ -178,9 +180,10 @@ export class Store {
         `UPDATE issues
          SET state = $1::varchar,
              current_task_id = NULL,
-             escalation_reason = CASE WHEN $1::varchar = 'ESCALATED' THEN $4::text ELSE escalation_reason END
+             escalation_reason = CASE WHEN $1::varchar = 'ESCALATED' THEN $4::text ELSE escalation_reason END,
+             review_feedback = COALESCE($5::text, review_feedback)
          WHERE id = $2 AND state = $3 AND deleted_at IS NULL`,
-        [transition.to, id, transition.from, reason ?? null]
+        [transition.to, id, transition.from, reason ?? null, fields.reviewFeedback ?? null]
       );
       if (updated.rowCount === 0) {
         await client.query("ROLLBACK");
@@ -410,6 +413,7 @@ export class Store {
       priority: row.priority as Issue["priority"],
       assignedAgent: row.assigned_agent as Issue["assignedAgent"],
       currentTaskId: (row.current_task_id as string | null) ?? undefined,
+      reviewFeedback: (row.review_feedback as string | null) ?? undefined,
       pullRequest:
         row.pr_number != null
           ? {

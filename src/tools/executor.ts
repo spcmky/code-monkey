@@ -27,23 +27,13 @@ export type AgentGitHub = Pick<
   | "commitFiles"
   | "findOpenPR"
   | "createPR"
-  | "listComments"
   | "listPRFiles"
   | "updatePR"
-  | "getAuthenticatedLogin"
 >;
 
 const MAX_FILE_CHARS = 200_000;
 const MAX_LISTED_FILES = 2_000;
 const MAX_PATCH_CHARS = 60_000;
-const MAX_REVIEWS_RETURNED = 3;
-
-/**
- * Marks a pull request comment as the automated reviewer's feedback. The
- * marker alone is not trusted - anyone can paste it - so feedback must also
- * be authored by the account the system acts as.
- */
-export const REVIEW_MARKER = "<!-- code-monkey:review -->";
 
 function splitRepo(repo: string): { owner: string; name: string } {
   const [owner, name] = repo.split("/");
@@ -225,25 +215,13 @@ export class CoderToolSession implements ToolSession {
   }
 
   /**
-   * Returns the automated reviewer's feedback only: comments that carry the
-   * review marker and were posted by the account the system acts as. Other
-   * people's comments on the pull request are never passed to the model.
+   * Returns the automated review this rework must address. It comes from the
+   * task the controller sent, which read it from the database; comments on
+   * the pull request are never read, so nobody else can speak as the reviewer.
    */
-  private async getReviewFeedback(): Promise<Record<string, unknown>> {
-    const pr = this.context.issue.pullRequest;
-    if (!pr) return { reviews: [] };
-    const [login, comments] = await Promise.all([
-      this.github.getAuthenticatedLogin(),
-      this.github.listComments(this.owner, this.repo, pr.number),
-    ]);
-    const reviews = comments
-      .filter((c) => c.author === login && c.body.includes(REVIEW_MARKER))
-      .slice(-MAX_REVIEWS_RETURNED)
-      .map((c) => ({
-        postedAt: c.createdAt,
-        feedback: c.body.replace(REVIEW_MARKER, "").trim(),
-      }));
-    return { reviews };
+  private getReviewFeedback(): Record<string, unknown> {
+    const feedback = this.context.issue.reviewFeedback;
+    return { feedback: feedback ?? null };
   }
 
   private async createPR(

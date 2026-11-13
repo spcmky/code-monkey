@@ -87,12 +87,16 @@ class FakeStore {
   async transitionIssue(
     id: string,
     t: StateTransition,
-    reason?: string
+    reason?: string,
+    fields: { reviewFeedback?: string } = {}
   ): Promise<boolean> {
     const issue = this.issues.get(id);
     if (!issue || issue.state !== t.from) return false;
     issue.state = t.to;
     issue.currentTaskId = undefined;
+    if (fields.reviewFeedback !== undefined) {
+      issue.reviewFeedback = fields.reviewFeedback;
+    }
     this.transitions.push({ issueId: id, from: t.from, to: t.to, reason });
     return true;
   }
@@ -190,6 +194,7 @@ describe("Controller", () => {
     Attributes?: Record<string, string>;
   }>;
   let sent: Array<{ agentType: string; issueId: string }>;
+  let sentFeedback: Array<string | undefined>;
   let deleted: string[];
   let triageRun: ReturnType<typeof vi.fn>;
   let notifyEscalation: ReturnType<typeof vi.fn>;
@@ -205,6 +210,7 @@ describe("Controller", () => {
     store = new FakeStore();
     resultQueue = [];
     sent = [];
+    sentFeedback = [];
     deleted = [];
     sendShouldFail = false;
     triageRun = vi.fn(async () => triageResult("implement"));
@@ -231,8 +237,10 @@ describe("Controller", () => {
         const body = JSON.parse(command.input.MessageBody ?? "{}") as {
           agentType: string;
           issueId: string;
+          context?: { issue?: { reviewFeedback?: string } };
         };
         sent.push({ agentType: body.agentType, issueId: body.issueId });
+        sentFeedback.push(body.context?.issue?.reviewFeedback);
         return {};
       }
       if (command instanceof ReceiveMessageCommand) {
@@ -564,7 +572,6 @@ describe("Controller", () => {
 
       const body = createComment.mock.calls[0]?.[3] as string;
       expect(createComment.mock.calls[0]?.[2]).toBe(42);
-      expect(body.startsWith("<!-- code-monkey:review -->")).toBe(true);
       expect(body).toContain("Missing null check");
       expect(body).toContain("src/fix.ts:3");
       expect(store.issues.get("issue-1")?.state).toBe("IN_PROGRESS");
@@ -609,20 +616,52 @@ describe("Controller", () => {
       // No review is posted for a coder that will never run
       expect(
         createComment.mock.calls.some((call) =>
-          String(call[3]).includes("<!-- code-monkey:review -->")
+          String(call[3]).includes("Automated review requested changes")
         )
       ).toBe(false);
     });
 
-    it("escalates when the review feedback cannot be posted", async () => {
+    it("stores the review with the state change and sends it to the coder", async () => {
+      store.add(makeIssue({ state: "UNDER_REVIEW", pullRequest: PR }));
+      enqueue({
+        ...reviewerResult("request_changes"),
+        output: { decision: "request_changes", reasoning: "Missing null check" },
+      });
+      await controller.poll();
+
+      expect(store.issues.get("issue-1")?.reviewFeedback).toContain(
+        "Missing null check"
+      );
+      expect(sent).toEqual([{ agentType: "coder", issueId: "issue-1" }]);
+      expect(sentFeedback[0]).toContain("Missing null check");
+    });
+
+    it("still reworks with the feedback when the pull request comment fails", async () => {
       createComment.mockRejectedValue(new Error("GitHub unavailable"));
       store.add(makeIssue({ state: "UNDER_REVIEW", pullRequest: PR }));
       enqueue(reviewerResult("request_changes"));
       await controller.poll();
 
-      expect(store.path("issue-1")).toEqual(["IN_PROGRESS", "ESCALATED"]);
-      expect(sent).toEqual([]);
+      expect(store.path("issue-1")).toEqual(["IN_PROGRESS"]);
+      expect(sent).toEqual([{ agentType: "coder", issueId: "issue-1" }]);
+      expect(sentFeedback[0]).toBeDefined();
       expect(deleted).toEqual(["r1"]);
+    });
+
+    it("gives the stored review to a coder the poll loop starts after a crash", async () => {
+      // State committed with the review, then the process died before dispatch
+      store.add(
+        makeIssue({
+          state: "IN_PROGRESS",
+          currentTaskId: undefined,
+          pullRequest: PR,
+          reviewFeedback: "Automated review requested changes.\n\nguard the null",
+        })
+      );
+      await controller.poll();
+
+      expect(sent).toEqual([{ agentType: "coder", issueId: "issue-1" }]);
+      expect(sentFeedback[0]).toContain("guard the null");
     });
 
     it("escalates on an unknown decision", async () => {

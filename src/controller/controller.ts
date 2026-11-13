@@ -17,7 +17,7 @@ import { createTransition, isValidTransition } from "./state-machine.js";
 import { ContextBuilder } from "../knowledge/context-builder.js";
 import { validateChangedFiles } from "../validation/scope.js";
 import { FactChecker } from "../validation/fact-check.js";
-import { branchForIssue, REVIEW_MARKER } from "../tools/executor.js";
+import { branchForIssue } from "../tools/executor.js";
 import { AgentResultSchema } from "../types/index.js";
 import { z } from "zod";
 import type {
@@ -329,7 +329,8 @@ export class Controller {
     to: IssueState,
     trigger: string,
     agentType?: AgentType,
-    reason?: string
+    reason?: string,
+    fields: { reviewFeedback?: string } = {}
   ): Promise<IssueState | null> {
     const reviewCycles =
       issue.state === "UNDER_REVIEW" && to === "IN_PROGRESS"
@@ -350,12 +351,16 @@ export class Controller {
     const applied = await this.store.transitionIssue(
       issue.id,
       transition,
-      forced ? REVIEW_LOOP_REASON : reason
+      forced ? REVIEW_LOOP_REASON : reason,
+      fields
     );
     if (!applied) return null;
 
     issue.state = transition.to;
     issue.currentTaskId = undefined;
+    if (fields.reviewFeedback !== undefined) {
+      issue.reviewFeedback = fields.reviewFeedback;
+    }
     return transition.to;
   }
 
@@ -539,14 +544,18 @@ export class Controller {
         );
       }
     } else if (decision === "request_changes") {
-      // State first, like every other side effect: once the transition
-      // commits, a redelivered copy of this result is dropped as stale, so
-      // the review is posted at most once.
+      // The review is stored in the same transaction as the state change, so
+      // every coder run from here on - including one the poll loop starts
+      // after a crash - receives it in its task. Once the transition commits,
+      // a redelivered copy of this result is dropped as stale.
+      const review = this.formatReview(result);
       const next = await this.transition(
         issue,
         "IN_PROGRESS",
         "review_changes_requested",
-        "reviewer"
+        "reviewer",
+        undefined,
+        { reviewFeedback: review }
       );
       if (next === "ESCALATED") {
         await this.announceEscalation(issue, REVIEW_LOOP_REASON, result);
@@ -554,17 +563,8 @@ export class Controller {
       }
       if (next !== "IN_PROGRESS") return;
 
-      // The coder reads this feedback from the pull request, so without it
-      // a rework run would be blind.
-      try {
-        await this.commentOnPullRequest(issue, this.formatReview(result), true);
-      } catch (error) {
-        logger.error(`Failed to post review feedback for issue ${issue.id}`, {
-          error,
-        });
-        await this.escalate(issue, "Could not post review feedback", result);
-        return;
-      }
+      // For humans watching the pull request; the coder does not need it
+      await this.commentOnPullRequest(issue, review);
       await this.startCoder(issue, "review_changes_requested");
     } else {
       await this.escalate(issue, "Reviewer escalated", result);
@@ -630,7 +630,6 @@ export class Controller {
       comments?: Array<{ path?: string; line?: number; body?: string; severity?: string }>;
     };
     const lines = [
-      REVIEW_MARKER,
       "Automated review requested changes.",
       "",
       output.reasoning ?? result.reasoning,
@@ -643,14 +642,10 @@ export class Controller {
   }
 
   /**
-   * Comments on the issue's pull request. Failures are logged unless the
-   * caller needs the comment to exist before going on.
+   * Comments on the issue's pull request. Best effort: these comments are for
+   * humans, so a failure is logged and nothing else depends on it.
    */
-  private async commentOnPullRequest(
-    issue: Issue,
-    body: string,
-    required = false
-  ): Promise<void> {
+  private async commentOnPullRequest(issue: Issue, body: string): Promise<void> {
     const [owner, repo] = issue.repo.split("/");
     if (!issue.pullRequest || !owner || !repo) return;
     try {
@@ -661,7 +656,6 @@ export class Controller {
         body
       );
     } catch (error) {
-      if (required) throw error;
       logger.error(`Failed to comment on pull request for issue ${issue.id}`, {
         error,
       });

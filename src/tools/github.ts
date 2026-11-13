@@ -58,7 +58,6 @@ export class GitHubClient {
   private secretArn: string;
   private region: string;
   private requestTimestamps: number[] = [];
-  private login?: string;
 
   constructor(config: { secretArn: string; region: string }) {
     if (!ARN_REGEX.test(config.secretArn)) {
@@ -480,19 +479,6 @@ export class GitHubClient {
     }, `updatePR(${owner}/${repo}#${prNumber})`);
   }
 
-  /** The login of the account this client acts as (the PAT's owner). */
-  async getAuthenticatedLogin(): Promise<string> {
-    if (this.login) return this.login;
-    await this.rateLimit();
-    const login = await withRetry(async () => {
-      const kit = await this.getOctokit();
-      const { data } = await kit.users.getAuthenticated();
-      return data.login;
-    }, "getAuthenticatedLogin");
-    this.login = login;
-    return login;
-  }
-
   /** Finds the open PR whose head is the given branch, if any. */
   async findOpenPR(
     owner: string,
@@ -512,28 +498,5 @@ export class GitHubClient {
       const pr = data[0];
       return pr ? { number: pr.number, url: pr.html_url } : null;
     }, `findOpenPR(${owner}/${repo}@${branch})`);
-  }
-
-  /** Lists comments on an issue or pull request, oldest first. */
-  async listComments(
-    owner: string,
-    repo: string,
-    issueNumber: number
-  ): Promise<Array<{ author: string; body: string; createdAt: string }>> {
-    await this.rateLimit();
-    return withRetry(async () => {
-      const kit = await this.getOctokit();
-      const data = await kit.paginate(kit.issues.listComments, {
-        owner,
-        repo,
-        issue_number: issueNumber,
-        per_page: 100,
-      });
-      return data.map((comment) => ({
-        author: comment.user?.login ?? "unknown",
-        body: comment.body ?? "",
-        createdAt: comment.created_at,
-      }));
-    }, `listComments(${owner}/${repo}#${issueNumber})`);
   }
 }
